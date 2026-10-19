@@ -26,7 +26,7 @@ from concurrent.futures import TimeoutError as FutTimeout  # noqa: F401 (reserve
 from urllib.parse import urlparse
 import urllib.request
 
-__version__ = "2.5.2"
+__version__ = "2.6.0"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -937,6 +937,99 @@ def _scan_prefixes(dirs: dict) -> tuple[dict, int]:
     return known, highest
 
 
+_GAP_SEEN: set[int] = set()
+
+
+def _audio_numbers(audio_dir: str) -> set[int]:
+    """Prefix numbers that have a real (non-partial) audio file on disk."""
+    out: set[int] = set()
+    try:
+        names = os.listdir(audio_dir)
+    except OSError:
+        return out
+    for name in names:
+        if ".part" in name or name.endswith(".ytdl"):
+            continue
+        m = re.match(r"^(\d+)_", name)
+        if m:
+            try:
+                out.add(int(m.group(1)))
+            except ValueError:
+                pass
+    return out
+
+
+def _load_manifest(path: str) -> dict:
+    """_numbering.json contents ({\"5\": {title, url}, …}), {} if absent."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _sync_manifest(man, man_path, no: int, vid) -> None:
+    """Record slot number -> title + url (atomic-ish write) so a later
+    deletion of ALL files for that slot can still be re-filled precisely."""
+    if man is None or man_path is None or no is None:
+        return
+    man[str(no)] = {"title": vid.get("title") or "",
+                    "url": vid.get("url") or ""}
+    try:
+        tmp = man_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(man, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, man_path)
+    except OSError:
+        pass
+
+
+def _sibling_title(dirs: dict, n: int):
+    """Recover an item's title from its Thumbnail / Text File files
+    (they share the sanitized stem with the deleted audio file)."""
+    for d in (dirs["thumb"], dirs["info"]):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for name in names:
+            if name.endswith(".part"):
+                continue
+            stem, ext = os.path.splitext(name)
+            if not ext and d is dirs["thumb"]:
+                continue
+            m = re.match(rf"^{n}_(.+)$", stem)
+            if m:
+                return m.group(1)
+    return None
+
+
+def _plan_repairs(dirs: dict, highest: int, known: dict,
+                  manifest: dict) -> dict:
+    """Find audio slots 1..highest with no audio file and build refill
+    candidates for each slot: (missing, by_url, by_title). The numbered
+    manifest is the primary source, Thumbnail/Text File stems the fallback.
+    Items already saved under another number are never duplicated."""
+    have = _audio_numbers(dirs["audio"])
+    missing = [n for n in range(1, highest + 1) if n not in have]
+    by_url: dict[str, int] = {}
+    by_title: dict[str, int] = {}
+    for n in missing:
+        rec = manifest.get(str(n))
+        if rec:
+            tkey = _clean_title(rec.get("title") or "")
+            # refill only when the item is not already saved elsewhere
+            if rec.get("url") and known.get(tkey, n) == n:
+                by_url[rec["url"]] = n
+                continue
+        sib = _sibling_title(dirs, n)
+        if sib is not None and known.get(sib, n) == n:
+            by_title[sib] = n
+    return {"have": have, "missing": missing,
+            "by_url": by_url, "by_title": by_title}
+
+
 def _music_info(info) -> str:
     artists = info.get("artists") or info.get("artist") or []
     if isinstance(artists, list):
@@ -1152,7 +1245,8 @@ def _fetch_thumbnail(info, stem: str, thumb_dir: str, ffmpeg_dir, args) -> str |
 
 
 def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
-                      dirs: dict, item_no: int | None = None) -> tuple:
+                      dirs: dict, item_no: int | None = None,
+                      manifest=None, manifest_path: str | None = None) -> tuple:
     """Download audio + thumbnail + write info txt for one scanned video.
     item_no is the file-number prefix (continues across sessions)."""
     _check_cancel()
@@ -1171,8 +1265,11 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
             except OSError:
                 pass
 
-    # ---- thumbnails already saved for this item (resume) ----
-    audio_done = any(f.startswith(stem + ".") for f in os.listdir(audio_dir))
+    # ---- partial downloads are NOT done audio (a killed .part file must
+    # re-download next run, not be skipped as "already saved") -----------
+    audio_done = any(f.startswith(stem + ".")
+                     and ".part" not in f and not f.endswith(".ytdl")
+                     for f in os.listdir(audio_dir))
     info_done = os.path.isfile(os.path.join(info_dir, stem + ".txt"))
     thumb_done = _thumb_exists(thumb_dir, stem)
 
@@ -1180,6 +1277,7 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
     log(f"{prefix} ▸ {vid['title']} ({_fmt_dur(vid.get('duration'))})")
     if audio_done and info_done and thumb_done:
         log(f"{prefix} ✓ skipped (already saved)")
+        _sync_manifest(manifest, manifest_path, item_no, vid)
         return True, None
 
     # ---- metadata ----
@@ -1265,6 +1363,7 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
     if not info_done:
         write_info_txt(os.path.join(info_dir, stem + ".txt"), vid, info, transcript, t_lang)
         log(f"{prefix} ✓ info saved: Text File/{stem}.txt")
+    _sync_manifest(manifest, manifest_path, item_no, vid)
     return True, None
 
 
@@ -1306,10 +1405,46 @@ def run_scan(url: str, args, ffmpeg_dir) -> tuple:
     if highest:
         log(f"· found files up to #{highest} — numbering continues from #{next_no}")
 
+    # gap repair: deleted audio leaves a hole between numbers. A numbered
+    # manifest (_numbering.json) and the Thumbnail/Text File stems let us
+    # put the exact video back into its original slot.
+    m_path = os.path.join(dest, "_numbering.json")
+    manifest = _load_manifest(m_path)
+    if not os.path.isfile(m_path):
+        log("· numbering manifest: _numbering.json (records every item's "
+            "slot, title and url so deleted files can be re-filled)")
+    plan = _plan_repairs(dirs, highest, known, manifest)
+    by_url, by_title = plan["by_url"], plan["by_title"]
+    missing = plan["missing"]
+    if missing:
+        fresh = [n for n in missing if n not in _GAP_SEEN]
+        _GAP_SEEN.update(missing)
+        if fresh:
+            log(f"· gap check: {len(missing)} audio slot(s) missing: "
+                + ", ".join(f"#{n}" for n in fresh))
+            for n in fresh:
+                rec = manifest.get(str(n))
+                sib = next((t for t, x in by_title.items() if x == n), None)
+                if n in by_url.values() and rec:
+                    log(f"  slot #{n} ⟳ will re-download "
+                        f"({(rec.get('title') or '')[:64]})")
+                elif sib:
+                    log(f"  slot #{n} ⟳ will re-download ({sib[:64]})")
+                else:
+                    log(f"  slot #{n} ⚠ stays empty — all its files were "
+                        "deleted, so the item cannot be identified")
+
     ok_n, fails = 0, []
     total = len(filtered)
     for i, vid in enumerate(filtered, 1):
-        no = known.get(_clean_title(vid["title"]))
+        key = _clean_title(vid["title"])
+        no = known.get(key)
+        if no is None and vid["url"] in by_url:
+            no = by_url.pop(vid["url"])
+            log(f"[{i}/{total}] ⟳ re-filling deleted slot #{no}")
+        if no is None and key in by_title:
+            no = by_title.pop(key)
+            log(f"[{i}/{total}] ⟳ re-filling deleted slot #{no}")
         if no is None:
             no = next_no
             next_no += 1
@@ -1320,7 +1455,8 @@ def run_scan(url: str, args, ffmpeg_dir) -> tuple:
                 _check_cancel()
         try:
             ok, err = process_scan_item(i, total, vid, args, ffmpeg_dir, dirs,
-                                        item_no=no)
+                                        item_no=no, manifest=manifest,
+                                        manifest_path=m_path)
         except KeyboardInterrupt:
             log(f"\n! interrupted at {i}/{total} — done items are kept; re-run to resume")
             raise
@@ -1562,6 +1698,7 @@ def _describe_cookies(path: str) -> tuple:
 def execute(args) -> int:
     """Run the full pipeline for parsed args. Usable from the CLI and the GUI.
     Returns 0 = all ok, 1 = some failures, 130 = stopped by user, 2 = bad input."""
+    _GAP_SEEN.clear()          # each run reports its gaps fresh
     if getattr(args, "update_ytdlp", False):
         return 0 if update_ytdlp() else 1
     # --mode selects a download mode

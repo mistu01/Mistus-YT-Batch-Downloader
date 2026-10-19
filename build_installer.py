@@ -42,7 +42,7 @@ import zipfile
 APP_NAME = "YT-Batch-Downloader-Mistu"
 ENGINE = "yt_batch_downloader_mistu.py"
 GUI = "mistu_gui.py"
-VERSION = "2.5.2"
+VERSION = "2.6.0"
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 BUILD_DIR = os.path.join(ROOT, "build")
