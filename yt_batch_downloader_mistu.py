@@ -24,7 +24,7 @@ from concurrent.futures import TimeoutError as FutTimeout  # noqa: F401 (reserve
 from urllib.parse import urlparse
 import urllib.request
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -489,10 +489,45 @@ _RETRYABLE_RE = re.compile(
 
 # Fallback ladder of player clients that bypass bot-gated webpage state
 # (no PO-token path used by community fallbacks; run as sequential passes).
+# The final entry drops cookies: exported web-session cookie state is what
+# poisons the watch page ("The page needs to be reloaded"), and public
+# videos never need cookies.
 _PLAYER_FALLBACKS = [
-    {"youtube": {"player_client": ["android", "web_safari"]}},
-    {"youtube": {"player_client": ["tv_simply"]}},
+    ({"youtube": {"player_client": ["android", "web_safari"]}}, False),
+    ({"youtube": {"player_client": ["tv_simply"]}}, False),
+    ({"youtube": {"player_client": ["android", "web_safari"]}}, True),
 ]
+
+
+def _with_player_fallbacks(base_opts: dict, prefix: str, run):
+    """Run `run(ydl)` across player-client passes when YouTube hard-blocks.
+
+    Ladder: as configured -> android/web_safari -> tv_simply again but
+    cookieless (fresh cache between passes). Raises the last error when
+    every pass fails; KeyboardInterrupt passes through untouched."""
+    for attempt in range(len(_PLAYER_FALLBACKS) + 1):
+        opts = base_opts
+        if attempt:
+            opts = dict(base_opts)
+            clients, drop_cookies = _PLAYER_FALLBACKS[attempt - 1]
+            opts["extractor_args"] = clients
+            if drop_cookies:
+                opts.pop("cookiefile", None)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return run(ydl)
+        except KeyboardInterrupt:
+            raise
+        except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
+            msg = str(exc).replace("\n", " ")
+            if msg.startswith("ERROR: "):
+                msg = msg[len("ERROR: "):]
+            if attempt < len(_PLAYER_FALLBACKS) and _RETRYABLE_RE.search(msg):
+                _close_ytdlp_cache()
+                log(f"{prefix} · hard block ({msg[:120]}) — retrying with an "
+                    "alternate player / fresh cache…")
+                continue
+            raise
 
 
 def _close_ytdlp_cache():
@@ -514,49 +549,39 @@ def download_one(index: int, total: int, url: str, args, ffmpeg_dir, archive) ->
     opts = build_ydl_opts(args, ffmpeg_dir, archive, hook)
     log(f"{prefix} ▸ {url}")
 
-    for attempt in range(3):
-        attempt_opts = opts
-        if attempt:  # fallback passes: alternate player clients, fresh cache
-            attempt_opts = dict(opts)
-            attempt_opts["extractor_args"] = _PLAYER_FALLBACKS[attempt - 1]
-        try:
-            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
-                if getattr(args, "quality", "") == "audio":
-                    # best-audio system: tags on every audio download
-                    try:
-                        ydl.add_post_processor(
-                            _SetMusicMetaPP(ydl,
-                                            artist=getattr(args, "artist", None),
-                                            title=getattr(args, "song_title", None)),
-                            when="pre_process")
-                    except Exception:
-                        pass
-                ydl.download([url])
-            log(f"{prefix} ✓ done")
-            return True, None
-        except KeyboardInterrupt:
-            log(f"{prefix} ! interrupted")
-            raise
-        except yt_dlp.utils.DownloadError as exc:
-            msg = str(exc).replace("\n", " ")
-            if msg.startswith("ERROR: "):
-                msg = msg[len("ERROR: "):]
-            if attempt < 2 and _RETRYABLE_RE.search(msg):
-                _close_ytdlp_cache()
-                log(f"{prefix} · hard block ({msg[:120]})")
-                log(f"{prefix} · retrying with an alternate web player "
-                    "and a fresh yt-dlp cache…")
-                continue
-            log(f"{prefix} ✗ FAILED: {msg[:200]}")
-            if _RETRYABLE_RE.search(msg):
-                msg += ("  [hint: YouTube is throttling this session — re-export "
-                        "cookies.txt, raise --scan-delay, or press ⬆ Update "
-                        "yt-dlp; then retry]")
-            return False, msg
-        except Exception as exc:  # unexpected
-            log(f"{prefix} ✗ FAILED: {exc}")
-            return False, str(exc)
-    return False, "unreachable"
+    def _run(ydl):
+        if getattr(args, "quality", "") == "audio":
+            # best-audio system: tags on every audio download
+            try:
+                ydl.add_post_processor(
+                    _SetMusicMetaPP(ydl,
+                                    artist=getattr(args, "artist", None),
+                                    title=getattr(args, "song_title", None)),
+                    when="pre_process")
+            except Exception:
+                pass
+        ydl.download([url])
+
+    try:
+        _with_player_fallbacks(opts, prefix, _run)
+        log(f"{prefix} ✓ done")
+        return True, None
+    except KeyboardInterrupt:
+        log(f"{prefix} ! interrupted")
+        raise
+    except yt_dlp.utils.DownloadError as exc:
+        msg = str(exc).replace("\n", " ")
+        if msg.startswith("ERROR: "):
+            msg = msg[len("ERROR: "):]
+        log(f"{prefix} ✗ FAILED: {msg[:200]}")
+        if _RETRYABLE_RE.search(msg):
+            msg += ("  [hint: YouTube is throttling this session — re-export "
+                    "cookies.txt, raise --scan-delay, or press ⬆ Update "
+                    "yt-dlp; then retry]")
+        return False, msg
+    except Exception as exc:  # unexpected
+        log(f"{prefix} ✗ FAILED: {exc}")
+        return False, str(exc)
 
 
 # ------------------------------------------------------------ channel scan ----
@@ -739,8 +764,7 @@ def _fetch_transcript(url: str, langs: list, workdir: str, args) -> tuple[str, s
     if args.cookies:
         opts["cookiefile"] = args.cookies
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
+        _with_player_fallbacks(opts, "  ", lambda ydl: ydl.download([url]))
     except Exception as exc:
         if args.verbose:
             log(f"  note: caption fetch hiccup: {exc}")
@@ -881,8 +905,11 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
     }
     if args.cookies:
         meta_opts["cookiefile"] = args.cookies
-    with yt_dlp.YoutubeDL(meta_opts) as ydl:
-        info = ydl.extract_info(vid["url"], download=False)
+    # cookie state can poison the watch page ("page needs to be reloaded")
+    # — reach for the same player-client ladder the downloads use
+    info = _with_player_fallbacks(
+        meta_opts, prefix,
+        lambda ydl: ydl.extract_info(vid["url"], download=False))
     if not info:
         return False, "metadata extraction failed"
 
@@ -926,34 +953,20 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
         }
         if ffmpeg_dir:
             opts["ffmpeg_location"] = ffmpeg_dir
-        for _attempt in range(3):
-            _a_opts = opts
-            if _attempt:
-                _a_opts = dict(opts)
-                _a_opts["extractor_args"] = _PLAYER_FALLBACKS[_attempt - 1]
+
+        def _run_audio(ydl):
+            artist = getattr(args, "artist", None)
+            song_title = getattr(args, "song_title", None)
             try:
-                with yt_dlp.YoutubeDL(_a_opts) as ydl:
-                    artist = getattr(args, "artist", None)
-                    song_title = getattr(args, "song_title", None)
-                    try:
-                        ydl.add_post_processor(
-                            _SetMusicMetaPP(ydl, artist=artist,
-                                            title=song_title),
-                            when="pre_process")
-                    except Exception:
-                        pass
-                    ydl.download([vid["url"]])
-                break
-            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
-                msg = str(exc).replace("\n", " ")
-                if msg.startswith("ERROR: "):
-                    msg = msg[len("ERROR: "):]
-                if _attempt < 2 and _RETRYABLE_RE.search(msg):
-                    _close_ytdlp_cache()
-                    log(f"{prefix} · hard block ({msg[:120]}) — retrying with "
-                        "an alternate player / fresh cache…")
-                    continue
-                raise
+                ydl.add_post_processor(
+                    _SetMusicMetaPP(ydl, artist=artist,
+                                    title=song_title),
+                    when="pre_process")
+            except Exception:
+                pass
+            ydl.download([vid["url"]])
+
+        _with_player_fallbacks(opts, prefix, _run_audio)
         _bitrate = " @ 320 kbps" if audio_format == "mp3" else ""
         log(f"{prefix} ✓ audio saved: Audio/{stem}.{audio_format}{_bitrate}")
 

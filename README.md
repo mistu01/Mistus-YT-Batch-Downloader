@@ -7,7 +7,7 @@ and FFmpeg — nothing else needs to be installed.
 
 ```
 ====================================================
-  YT-Batch-Downloader-Mistu  v2.1.0
+  YT-Batch-Downloader-Mistu  v2.2.0
   YouTube batch downloader • channel scanner •  engine: yt-dlp
 ====================================================
 ```
