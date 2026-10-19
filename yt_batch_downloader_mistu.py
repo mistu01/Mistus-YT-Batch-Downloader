@@ -26,7 +26,7 @@ from concurrent.futures import TimeoutError as FutTimeout  # noqa: F401 (reserve
 from urllib.parse import urlparse
 import urllib.request
 
-__version__ = "2.5.1"
+__version__ = "2.5.2"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -706,6 +706,43 @@ def cookieopts(args) -> dict:
     if parsed:
         return {"cookiesfrombrowser": parsed}
     return {"cookiefile": c}
+
+
+def _probe_browser_cookies(args) -> bool:
+    """Pre-flight load of live-browser cookies, once per run.
+
+    Returns True when cookies are usable (or the input is not a browser).
+    On failure it logs the reason plus the concrete fix and switches the
+    whole run to cookieless — far better than a raw traceback mid-scan.
+    The main real-world failure is Chrome 127+ 'app-bound encryption'
+    (yt-dlp issue #10927): Google encrypts Chrome's cookie DB so that only
+    Chrome itself can decrypt it; no external tool can read it anymore."""
+    parsed = _parse_browser_cookie(getattr(args, "cookies", None))
+    if not parsed:
+        return True
+    name, prof = parsed
+    try:
+        from yt_dlp.cookies import extract_cookies_from_browser
+        jar = extract_cookies_from_browser(name, prof)
+        log(f"· cookies: live browser session via {name}"
+            + (f" (profile '{prof}')" if prof else " (default profile)")
+            + f" — {len(jar)} cookies, always fresh")
+        return True
+    except Exception as exc:
+        msg = str(exc).replace("\n", " ")
+        log(f"· cookies: browser '{name}' could not be read — {msg[:140]}")
+        if "dpapi" in msg.lower() or "decrypt" in msg.lower():
+            log("· cookies: this is Chrome 127+ 'app-bound encryption' — Google")
+            log("  blocks ALL external tools from decrypting (yt-dlp issue #10927).")
+            log("  Working fixes:  1) type  firefox  in the cookies field (Firefox")
+            log("  has no encryption wall), or  2) export cookies.txt with the")
+            log("  'Get cookies.txt LOCALLY' Chrome extension and select that file.")
+        else:
+            log("· cookies: fix the browser session, or use a cookies.txt file instead.")
+        log("· cookies: continuing WITHOUT cookies — public channels work fine")
+        log("  (the player-fallback ladder is cookieless-first by design).")
+        args.cookies = None
+        return False
 
 
 def _session_key(opts: dict) -> str:
@@ -1580,14 +1617,12 @@ def execute(args) -> int:
     dest = os.path.abspath(args.dest)
     os.makedirs(dest, exist_ok=True)
 
-    # cookie transparency: show the user exactly what will be used
-    bb = _parse_browser_cookie(getattr(args, "cookies", None))
-    if bb:
-        _bname, _bprof = bb
-        log(f"· cookies: live browser session via {_bname}"
-            + (f" (profile '{_bprof}')" if _bprof else " (default profile)")
-            + " — always fresh, best for long runs")
-    elif getattr(args, "cookies", None):
+    # cookie transparency + pre-flight: browser cookies are probed once so a
+    # load failure (Chrome app-bound encryption, locked DB, …) degrades to a
+    # clearly-explained cookieless run instead of crashing mid-scan.
+    _probe_browser_cookies(args)
+    if (getattr(args, "cookies", None)
+            and not _is_browser_cookie(args.cookies)):
         cinfo, cprob = _describe_cookies(args.cookies)
         if cinfo:
             log(f"· cookies: {args.cookies}  ({cinfo})")
