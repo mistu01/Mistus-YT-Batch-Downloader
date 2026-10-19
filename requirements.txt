@@ -1,0 +1,8 @@
+# For development WITHOUT the portable bundle:
+#   pip install -r requirements.txt
+# (The distributed bundle contains these packages pre-installed in app/.)
+yt-dlp>=2024.3.10
+brotli
+certifi
+mutagen
+websockets

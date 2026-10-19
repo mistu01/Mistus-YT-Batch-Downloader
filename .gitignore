@@ -1,0 +1,29 @@
+# --- Build outputs -----------------------------------------------------------
+dist/
+build/
+*.exe
+*.msi
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- App runtime data (never commit these!) ----------------------------------
+# cookies = live login session, downloaded.txt = user archive, own music = piracy
+cookies.txt
+*.cookies
+downloaded.txt
+*.part
+yt/
+
+# --- OS / editor junk --------------------------------------------------------
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.idea/
+.vscode/
+*.swp

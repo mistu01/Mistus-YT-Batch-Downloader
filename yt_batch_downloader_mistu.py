@@ -1,0 +1,1369 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+YT-Batch-Downloader-Mistu  —  YouTube batch downloader (CLI)
+
+Core engine: yt-dlp (https://github.com/yt-dlp/yt-dlp).
+Designed to ship as a fully portable bundle: embedded Python + yt-dlp + FFmpeg.
+No installation required — the build script produces a self-contained zip.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FutTimeout  # noqa: F401 (reserved)
+from urllib.parse import urlparse
+import urllib.request
+
+__version__ = "2.1.0"
+APP_NAME = "Mistus Batch YT Downloader"
+
+try:
+    import yt_dlp
+except ImportError:  # pragma: no cover
+    sys.stderr.write(
+        f"{APP_NAME}: the 'yt-dlp' package is required.\n"
+        "  pip install yt-dlp\n"
+    )
+    raise SystemExit(2)
+
+try:
+    from yt_dlp.postprocessor.common import PostProcessor as _BasePP
+except Exception:  # pragma: no cover
+    _BasePP = object
+
+
+class _SetMusicMetaPP(_BasePP):
+    """Post-processor that writes final audio tags:
+    artist  = user-entered artist, else channel/uploader
+    title   = user-entered song title, else the video title."""
+
+    def __init__(self, downloader, artist=None, title=None):
+        super().__init__(downloader)
+        self._artist = artist
+        self._title = title
+
+    def run(self, info):
+        artist = (self._artist
+                  or info.get("channel")
+                  or info.get("uploader")
+                  or info.get("creator")
+                  or info.get("uploader_id")
+                  or "Unknown Artist")
+        info["artist"] = artist
+        info["artists"] = [artist]
+        info["creator"] = artist
+        info["album_artist"] = artist
+        info["track"] = self._title or info.get("track") or info.get("title") or "Unknown Title"
+        if self._title:
+            info["title"] = self._title
+        return [], info
+
+# ---------------------------------------------------------------- console ---
+PRINT_LOCK = threading.Lock()
+_LOG = None                       # injectable logger (GUI uses a queue sink)
+_CANCEL_LATCH = threading.Event()  # cooperative stop flag
+
+
+class RunCancelled(Exception):
+    """Raised inside the pipeline when the user pressed Stop."""
+
+
+def set_logger(fn) -> None:
+    """GUIs install a log sink: log lines go to fn(msg) instead of stdout."""
+    global _LOG
+    _LOG = fn
+
+
+def request_cancel() -> None:
+    """Ask the running pipeline to stop after the current download."""
+    _CANCEL_LATCH.set()
+
+
+def reset_cancel() -> None:
+    _CANCEL_LATCH.clear()
+
+
+def is_cancelled() -> bool:
+    return _CANCEL_LATCH.is_set()
+
+
+def _check_cancel() -> None:
+    if _CANCEL_LATCH.is_set():
+        raise RunCancelled()
+
+
+def _force_utf8_stdio() -> None:
+    """Make sure we can print unicode symbols on Windows consoles."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def term_width(default: int = 100) -> int:
+    try:
+        return max(20, shutil.get_terminal_size((default, 24)).columns - 1)
+    except Exception:
+        return default
+
+
+def log(msg: str = "") -> None:
+    with PRINT_LOCK:
+        if _LOG is not None:
+            try:
+                _LOG(msg)
+            except Exception:
+                pass
+            return
+        try:
+            print(msg, flush=True)
+        except Exception:
+            print(msg.encode("ascii", "replace").decode("ascii"), flush=True)
+
+
+def human_size(n) -> str:
+    if not n:
+        return "?"
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024.0:
+            return f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}TiB"
+
+
+def human_time(seconds) -> str:
+    if seconds is None:
+        return "?"
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return "?"
+    m, s = divmod(max(0, seconds), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+# ------------------------------------------------------------- arguments ----
+EXAMPLES = """\
+examples:
+  %(prog)s https://www.youtube.com/watch?v=dQw4w9WgXcQ
+  %(prog)s -q 1080 -d "D:/Media/Songs" urls.txt
+  %(prog)s -j 3 --no-playlist -q 720 url1 url2 url3
+  %(prog)s -q audio --audio-format mp3 --playlist-limit 15 "https://www.youtube.com/playlist?list=PL..."
+  %(prog)s -q 1080 --subs --subs-langs "en.*,hi" list.txt
+"""
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description=(
+            "YouTube batch downloader powered by yt-dlp.\n"
+            "Pass one or more URLs (or a .txt file with one URL per line)."
+        ),
+        epilog=EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "targets", nargs="*", metavar="URL|FILE",
+        help="video/playlist URL(s), or a text file with one URL per line "
+             "(lines starting with '#' are ignored)",
+    )
+    out = parser.add_argument_group("output")
+    out.add_argument("-d", "--dest", default="downloads", metavar="DIR",
+                     help='destination folder (default: "downloads")')
+    out.add_argument("-q", "--quality",
+                     choices=["best", "2160", "1440", "1080", "720", "480", "360", "audio"],
+                     default="best",
+                     help="max video height / 'audio' for audio-only (default: best)")
+    out.add_argument("--audio-format", choices=["mp3", "m4a", "opus", "vorbis", "flac", "wav"],
+                     default=None, metavar="FMT",
+                     help="audio container when -q audio is used (default: mp3)")
+
+    scope = parser.add_argument_group("scope")
+    scope.add_argument("--scan", action="store_true",
+                       help="force channel-scan mode (default behaviour for channel "
+                            "URLs like youtube.com/@name): scrape every long video "
+                            "and save its audio, thumbnail and an info .txt file")
+    scope.add_argument("--regular", action="store_true",
+                       help="regular mode: download the given video(s)/playlist(s) only; "
+                            "never scan a whole channel (thumbnail/text info off by default)")
+    scope.add_argument("--mode", choices=["scan", "regular", "music"], default=None,
+                        help="download mode: scan (channel scan), regular (batch), or music")
+    scope.add_argument("--shorts", action="store_true",
+                       help="scan mode: also include the channel's Shorts")
+    scope.add_argument("--min-length", default=None, metavar="LEN",
+                       help='scan mode: only videos at least LEN long ("90", "2:30", "1:02:00")')
+    scope.add_argument("--max-length", default=None, metavar="LEN",
+                       help="scan mode: only videos at most LEN long")
+    scope.add_argument("--scan-delay", type=float, default=3.0, metavar="SEC",
+                       help="scan mode: pause between videos to avoid bot-rate-limits "
+                            "(default: 3 — safe delay; 0 = no pause)")
+    scope.add_argument("--no-playlist", action="store_true",
+                       help="if a URL points to both a video and a playlist, download only the video")
+    scope.add_argument("--single", dest="no_playlist", action="store_true",
+                       help="alias for --no-playlist: download only the single video, ignore any playlist")
+    scope.add_argument("--playlist-limit", type=int, default=0, metavar="N",
+                       help="download at most N entries from a playlist (0 = all)")
+    scope.add_argument("--keep-dupes", action="store_true",
+                       help="do not remove duplicate URLs from the input")
+
+    resume = parser.add_argument_group("resume / archive")
+    resume.add_argument("--archive", default=None, metavar="FILE",
+                        help=r"download history file (default: <dest>\downloaded.txt); "
+                             "already-listed videos are skipped")
+    resume.add_argument("--no-archive", action="store_true",
+                        help="do not use a download archive at all")
+    resume.add_argument("--redo", action="store_true",
+                        help="ignore the archive for this run (re-download everything)")
+
+    media = parser.add_argument_group("media extras")
+    media.add_argument("--subs", action="store_true",
+                       help="also download subtitles")
+    media.add_argument("--subs-langs", default="en.*", metavar="LANGS",
+                       help='subtitle languages, comma separated (default: "en.*")')
+    media.add_argument("--no-thumb", action="store_true",
+                       help="do not embed the thumbnail into the file")
+    media.add_argument("--no-meta", action="store_true",
+                       help="do not embed metadata (title, tags, chapters)")
+    media.add_argument("--music", action="store_true",
+                       help="music mode: best audio -> m4a, embed cover art + metadata, "
+                            "tag artist/title from --artist/--song-title")
+    media.add_argument("--artist", default=None, metavar="NAME",
+                       help="artist name for music mode (overrides metadata)")
+    media.add_argument("--song-title", "--title", dest="song_title", default=None,
+                       metavar="TITLE",
+                       help="song title for music mode (overrides metadata)")
+
+    engine = parser.add_argument_group("engine")
+    engine.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
+                        help="parallel downloads (default: 1; >1 disables the live progress bar)")
+    engine.add_argument("--retries", type=int, default=10, metavar="N",
+                        help="network retries per item (default: 10)")
+    engine.add_argument("--format", default=None, metavar="SELECTOR",
+                        help="raw yt-dlp format selector — overrides -q/--quality")
+    engine.add_argument("--cookies", default=None, metavar="FILE",
+                        help="Netscape-format cookies.txt (for age-restricted/member videos)")
+    engine.add_argument("-v", "--verbose", action="store_true",
+                        help="show yt-dlp debug output")
+    engine.add_argument("--update-ytdlp", action="store_true",
+                        help="update yt-dlp (via pip) to the latest version and exit")
+    parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
+    args = parser.parse_args(argv)
+
+    if not args.targets:
+        parser.print_help()
+        raise SystemExit(2)
+    if args.jobs < 1:
+        parser.error("--jobs must be >= 1")
+    # --audio-format implies audio-only
+    if args.audio_format and args.quality != "audio":
+        args.quality = "audio"
+    for opt in ("min_length", "max_length"):
+        try:
+            setattr(args, opt, parse_len(getattr(args, opt)) if getattr(args, opt) else None)
+        except ValueError:
+            parser.error(f"--{opt.replace('_', '-')} must be like '90', '2:30' or '1:02:00'")
+    return args
+
+
+def parse_len(text) -> int | None:
+    """'90' -> 90s, '2:30' -> 150s, '1:02:00' -> 3720s."""
+    if text is None:
+        return None
+    text = str(text).strip().lower()
+    if not text:
+        return None
+    if ":" in text:
+        parts = text.split(":")
+        if not all(p.isdigit() for p in parts) or len(parts) > 3:
+            raise ValueError(text)
+        secs = 0
+        for p in parts:
+            secs = secs * 60 + int(p)
+        return secs
+    if not text.isdigit():
+        raise ValueError(text)
+    return int(text)
+
+
+def collect_urls(targets, dedupe: bool) -> list:
+    urls, seen, dropped = [], set(), 0
+    for target in targets:
+        if os.path.isfile(target):
+            with open(target, "r", encoding="utf-8-sig", errors="replace") as fh:
+                lines = fh.readlines()
+        else:
+            # also accept comma-separated URLs on the command line
+            lines = target.split(",")
+        for raw in lines:
+            u = raw.strip()
+            if not u or u.startswith("#"):
+                continue
+            key = u.lower()
+            if dedupe and key in seen:
+                dropped += 1
+                continue
+            seen.add(key)
+            urls.append(u)
+    if dropped:
+        log(f"· skipped {dropped} duplicate URL(s)")
+    return urls
+
+
+# ------------------------------------------------------------ yt-dlp opts ----
+def find_ffmpeg() -> str | None:
+    """Locate a bundled or system-wide ffmpeg; returns the containing folder."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "ffmpeg", "bin"),
+        os.path.join(here, "ffmpeg"),
+    ]
+    for cand in candidates:
+        if os.path.isfile(os.path.join(cand, "ffmpeg.exe")) or \
+           os.path.isfile(os.path.join(cand, "ffmpeg")):
+            return cand
+    found = shutil.which("ffmpeg")
+    return os.path.dirname(found) if found else None
+
+
+def format_for(args, has_ffmpeg: bool) -> str:
+    """Pick a yt-dlp format selector that never *requires* merging when
+    FFmpeg is unavailable (fallbacks below always end on a muxed single file)."""
+    selector = args.format
+    if selector:
+        return selector
+    q = args.quality
+    if q == "best":
+        return "bestvideo*+bestaudio/best" if has_ffmpeg else "best"
+    if q == "audio":
+        return "bestaudio/best" if has_ffmpeg else "bestaudio/best/best"
+    height = int(q)
+    if has_ffmpeg:
+        return f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
+    return f"best[height<={height}]/best"
+
+
+def build_ydl_opts(args, ffmpeg_dir, archive, hook):
+    dest = args.dest
+    audio_only = args.quality == "audio"
+    has_ffmpeg = ffmpeg_dir is not None
+
+    postprocessors = []
+    if not args.no_meta and has_ffmpeg:
+        postprocessors.append({"key": "FFmpegMetadata", "add_metadata": True})
+    if audio_only:
+        if has_ffmpeg:
+            codec = args.audio_format or "mp3"
+            postprocessors.append({
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": codec,
+                # mp3 → fixed 320 kbps CBR; other codecs keep 'best' handling
+                "preferredquality": "320" if codec == "mp3" else "0",
+            })
+    if not args.no_thumb and has_ffmpeg:
+        postprocessors.append({"key": "EmbedThumbnail"})
+
+    opts = {
+        "format": format_for(args, has_ffmpeg),
+        "outtmpl": os.path.join("%(title)s [%(id)s].%(ext)s"),
+        "paths": {"home": dest},
+        "quiet": not args.verbose,
+        "verbose": args.verbose,
+        "no_warnings": not args.verbose,
+        "noprogress": True,               # we render our own progress
+        "progress_hooks": [hook],
+        "retries": args.retries,
+        "fragment_retries": args.retries,
+        "extractor_retries": 3,
+        "socket_timeout": 30,
+        "ignoreerrors": False,
+        "concurrent_fragment_downloads": 4,
+        "noplaylist": args.no_playlist,
+        "writethumbnail": (not args.no_thumb) and has_ffmpeg,
+        "postprocessors": postprocessors,
+    }
+    if ffmpeg_dir:
+        opts["ffmpeg_location"] = ffmpeg_dir
+    if archive and not args.redo:
+        opts["download_archive"] = archive
+    if args.playlist_limit and args.playlist_limit > 0:
+        opts["playlistend"] = args.playlist_limit
+    if args.subs:
+        opts["writesubtitles"] = True
+        opts["subtitleslangs"] = [s.strip() for s in args.subs_langs.split(",") if s.strip()]
+    if args.cookies:
+        opts["cookiefile"] = args.cookies
+    return opts
+
+
+# --------------------------------------------------------------- progress ----
+def _item_title(d) -> str:
+    info = d.get("info_dict") or {}
+    title = info.get("title")
+    if not title:
+        fname = d.get("filename") or "?"
+        title = os.path.splitext(os.path.basename(fname))[0]
+    return str(title)[:60]
+
+
+def make_hook(prefix: str, parallel: bool):
+    """progress hook — inline bar (sequential) or sparse lines (parallel)."""
+    state = {"pct": -100.0}
+
+    def report_downloading(d):
+        title = _item_title(d)
+        got = d.get("downloaded_bytes") or 0
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        speed, eta = d.get("speed"), d.get("eta")
+        if total > 0:
+            pct = got * 100.0 / total
+        else:
+            pct = None
+
+        head = f"{prefix} {title}"
+        if parallel:
+            # sparse full-line updates to keep multi-thread output readable
+            show = pct is None or pct >= state["pct"] + 5.0 or pct >= 100.0
+            if not show:
+                return
+            state["pct"] = pct if pct is not None else state["pct"]
+            body = (f"… {pct:5.1f}%" if pct is not None else f"… {human_size(got)}")
+            extra = f" ({human_size(got)}/{human_size(total)})" if total else ""
+            log(f"{head} {body}{extra}")
+            return
+
+        w = term_width()
+        if pct is not None:
+            filled = min(24, int(pct / 100.0 * 24))
+            bar = "#" * filled + "-" * (24 - filled)
+            line = f"{head:<48.48} [{bar}] {pct:5.1f}% {human_size(got)}" \
+                   + (f"/{human_size(total)}" if total else "")
+        else:
+            line = f"{head:<48.48} [--------]  ??% {human_size(got)}"
+        if speed:
+            line += f" {human_size(speed)}/s"
+        if eta:
+            line += f" ETA {human_time(eta)}"
+        with PRINT_LOCK:
+            try:
+                print("\r" + line[:w] + " " * max(0, w - (len(line) + 2)), end="", flush=True)
+            except Exception:
+                pass
+
+    def hook(d):
+        status = d.get("status")
+        if status == "downloading":
+            report_downloading(d)
+        elif status == "finished" and not parallel:
+            title = _item_title(d)
+            with PRINT_LOCK:
+                print(f"\r{prefix} {title:<48.48} [########################] 100.0%"
+                      f" — merging / processing…", flush=True)
+    return hook
+
+
+_RETRYABLE_RE = re.compile(
+    r"page needs to be reloaded"
+    r"|not a bot"
+    r"|429|too many requests"
+    r"|sign in to confirm"
+    r"|try again later"
+    r"|requested format is not available",
+    re.I)
+
+# Fallback ladder of player clients that bypass bot-gated webpage state
+# (no PO-token path used by community fallbacks; run as sequential passes).
+_PLAYER_FALLBACKS = [
+    {"youtube": {"player_client": ["android", "web_safari"]}},
+    {"youtube": {"player_client": ["tv_simply"]}},
+]
+
+
+def _close_ytdlp_cache():
+    """Drop yt-dlp's on-disk cache (stale webpage/nsig state)."""
+    try:
+        probe = yt_dlp.YoutubeDL({"quiet": True})
+        cdir = getattr(getattr(probe, "cache", None), "cache_dir", None)
+    except Exception:
+        cdir = None
+    if cdir and os.path.isdir(cdir):
+        shutil.rmtree(cdir, ignore_errors=True)
+
+
+def download_one(index: int, total: int, url: str, args, ffmpeg_dir, archive) -> tuple:
+    """Download a single URL. Returns (ok: bool, error: str|None)."""
+    _check_cancel()
+    prefix = f"[{index}/{total}]"
+    hook = make_hook(prefix, parallel=(args.jobs > 1))
+    opts = build_ydl_opts(args, ffmpeg_dir, archive, hook)
+    log(f"{prefix} ▸ {url}")
+
+    for attempt in range(3):
+        attempt_opts = opts
+        if attempt:  # fallback passes: alternate player clients, fresh cache
+            attempt_opts = dict(opts)
+            attempt_opts["extractor_args"] = _PLAYER_FALLBACKS[attempt - 1]
+        try:
+            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                if getattr(args, "quality", "") == "audio":
+                    # best-audio system: tags on every audio download
+                    try:
+                        ydl.add_post_processor(
+                            _SetMusicMetaPP(ydl,
+                                            artist=getattr(args, "artist", None),
+                                            title=getattr(args, "song_title", None)),
+                            when="pre_process")
+                    except Exception:
+                        pass
+                ydl.download([url])
+            log(f"{prefix} ✓ done")
+            return True, None
+        except KeyboardInterrupt:
+            log(f"{prefix} ! interrupted")
+            raise
+        except yt_dlp.utils.DownloadError as exc:
+            msg = str(exc).replace("\n", " ")
+            if msg.startswith("ERROR: "):
+                msg = msg[len("ERROR: "):]
+            if attempt < 2 and _RETRYABLE_RE.search(msg):
+                _close_ytdlp_cache()
+                log(f"{prefix} · hard block ({msg[:120]})")
+                log(f"{prefix} · retrying with an alternate web player "
+                    "and a fresh yt-dlp cache…")
+                continue
+            log(f"{prefix} ✗ FAILED: {msg[:200]}")
+            if _RETRYABLE_RE.search(msg):
+                msg += ("  [hint: YouTube is throttling this session — re-export "
+                        "cookies.txt, raise --scan-delay, or press ⬆ Update "
+                        "yt-dlp; then retry]")
+            return False, msg
+        except Exception as exc:  # unexpected
+            log(f"{prefix} ✗ FAILED: {exc}")
+            return False, str(exc)
+    return False, "unreachable"
+
+
+# ------------------------------------------------------------ channel scan ----
+def looks_like_channel(url: str) -> bool:
+    """Heuristic: channel-ish YouTube URLs default to scan mode."""
+    try:
+        path = urlparse(url).path.rstrip("/").lower()
+    except ValueError:
+        return False
+    first = next((p for p in path.split("/") if p), "")
+    return first.startswith("@") or first in ("channel", "c", "user", "videos", "shorts")
+
+
+def _channel_tab_urls(url: str, include_shorts: bool) -> list:
+    path = urlparse(url).path.rstrip("/").lower()
+    if path.endswith("/shorts"):
+        return [url]
+    if path.endswith("/videos"):
+        tabs = [url]
+        if include_shorts:
+            tabs.append(url[: -len("/videos")] + "/shorts")
+        return tabs
+    base = url.rstrip("/")
+    tabs = [f"{base}/videos"]
+    if include_shorts:
+        tabs.append(f"{base}/shorts")
+    return tabs
+
+
+def scan_channel(url: str, args) -> tuple[str, list]:
+    """Flat-extract a channel's videos (+shorts). Returns (channel_name, videos)."""
+    log(f"· scanning channel: {url}")
+    videos, seen = [], set()
+    chan_name = None
+    scan_opts = {
+        "quiet": not args.verbose,
+        "verbose": args.verbose,
+        "no_warnings": not args.verbose,
+        "extract_flat": True,
+        "socket_timeout": 30,
+        "extractor_retries": 3,
+        "ignoreerrors": True,          # skip dead members instead of dying
+        "logger": None,
+    }
+    if args.cookies:
+        scan_opts["cookiefile"] = args.cookies
+    if args.playlist_limit and args.playlist_limit > 0:
+        scan_opts["playlistend"] = args.playlist_limit
+    for tab in _channel_tab_urls(url, include_shorts=args.shorts):
+        is_short_tab = tab.rstrip("/").lower().endswith("/shorts")
+        log(f"· scan tab: {tab}")
+        with yt_dlp.YoutubeDL(scan_opts) as ydl:
+            info = ydl.extract_info(tab, download=False)
+        if not info:
+            continue
+        chan_name = chan_name or (info.get("channel") or info.get("uploader")
+                                  or info.get("title") or "channel")
+        for e in (info.get("entries") or []):
+            if not e or not e.get("id"):
+                continue
+            if e["id"] in seen:
+                continue
+            seen.add(e["id"])
+            videos.append({
+                "id": e.get("id"),
+                "title": e.get("title") or e.get("id"),
+                "url": e.get("webpage_url") or f"https://www.youtube.com/watch?v={e.get('id')}",
+                "duration": e.get("duration"),
+                "short": bool(is_short_tab or e.get("shorts_only") or
+                              (e.get("duration") or 0) and (e.get("duration") or 0) <= 0),
+            })
+    return (chan_name or "channel"), videos
+
+
+def _length_ok(duration, v_min, v_max) -> bool:
+    if v_min is None and v_max is None:
+        return True
+    if duration is None:
+        return False
+    if v_min is not None and duration < v_min:
+        return False
+    if v_max is not None and duration > v_max:
+        return False
+    return True
+
+
+def _fmt_dur(seconds) -> str:
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return "?"
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _clean_title(title: str) -> str:
+    t = yt_dlp.utils.sanitize_filename(str(title), restricted=True)
+    t = re.sub(r"\s+", "_", t.strip()) or "untitled"
+    return t[:100]
+
+
+def _scan_prefixes(dirs: dict) -> tuple[dict, int]:
+    """Inventory numbered files across the output subfolders.
+
+    Returns (title_key -> existing number, highest number seen)."""
+    known: dict[str, int] = {}
+    highest = 0
+    for d in dirs.values():
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            m = re.match(r"^(\d+)_(.*)$", name)
+            if not m:
+                continue
+            try:
+                n = int(m.group(1))
+            except ValueError:
+                continue
+            highest = max(highest, n)
+            key = os.path.splitext(m.group(2))[0]
+            known.setdefault(key, n)
+    return known, highest
+
+
+def _music_info(info) -> str:
+    artists = info.get("artists") or info.get("artist") or []
+    if isinstance(artists, list):
+        artists = ", ".join(artists)
+    composers = info.get("composer") or []
+    if isinstance(composers, list):
+        composers = ", ".join(composers)
+    pairs = [
+        ("Track", info.get("track")),
+        ("Artist", artists or info.get("creator") or info.get("uploader")),
+        ("Album", info.get("album")),
+        ("Composer", composers),
+        ("Track number", info.get("track_number")),
+        ("Release date", info.get("release_date")),
+    ]
+    rows = [f"    {k}: {v}" for k, v in pairs if v]
+    return "\n".join(rows) if rows else "    (none)"
+
+
+def vtt_to_text(path: str) -> str:
+    out = []
+    tag_re = re.compile(r"<[^>]+>")
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or "-->" in line or line.isdigit():
+                continue
+            if line.startswith(("WEBVTT", "NOTE", "Kind:", "Language:", "STYLE", "REGION")):
+                continue
+            line = tag_re.sub("", line).strip()
+            # drop consecutive duplicate lines (rolling captions)
+            if line and (not out or line != out[-1]):
+                out.append(line)
+    return "\n".join(out)
+
+
+def _fetch_transcript(url: str, langs: list, workdir: str, args) -> tuple[str, str]:
+    """Download captions with a skip-download run; returns (lang, transcript)."""
+    opts = {
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": langs,
+        "subtitlesformat": "vtt/best",
+        "outtmpl": os.path.join(workdir, "%(id)s.%(ext)s"),
+        "quiet": not args.verbose,
+        "verbose": args.verbose,
+        "no_warnings": not args.verbose,
+        "noprogress": True,
+        "socket_timeout": 30,
+        "extractor_retries": 3,
+    }
+    if args.cookies:
+        opts["cookiefile"] = args.cookies
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except Exception as exc:
+        if args.verbose:
+            log(f"  note: caption fetch hiccup: {exc}")
+    for name in sorted(os.listdir(workdir)):
+        if name.endswith(".vtt"):
+            return (os.path.splitext(name)[0].rsplit(".", 1)[-1], vtt_to_text(os.path.join(workdir, name)))
+    return ("", "")
+
+
+def write_info_txt(path: str, vid, info, transcript: str, t_lang: str) -> None:
+    tags = info.get("tags") or []
+    lines = [
+        f"Video URL: {vid.get('url') or 'https://www.youtube.com/watch?v=' + str(vid.get('id'))}",
+        f"Video Title: {info.get('title') or vid.get('title')}",
+        f"Channel: {info.get('channel') or info.get('uploader') or ''}",
+        f"Upload date: {info.get('upload_date') or ''}",
+        f"Duration: {_fmt_dur(info.get('duration'))}",
+        f"Views: {info.get('view_count') or ''}",
+        "",
+        "Description:",
+        (info.get("description") or "(no description)").strip(),
+        "",
+        f"Tags: {', '.join(tags) if tags else '(none)'}",
+        "Music information:",
+        _music_info(info),
+        "",
+        f"Transcription{(f' [{t_lang}]' if t_lang else '')}:",
+        transcript or "(no captions available)",
+    ]
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def _clean_thumb_strays(thumb_dir: str, prefix: str, keep_ext: str) -> None:
+    """Remove intermediate thumbnail files once the final one exists."""
+    for name in os.listdir(thumb_dir):
+        if not name.startswith(prefix + "."):
+            continue
+        base, ext = os.path.splitext(name)
+        if ext.lower() in (".webp", ".jpg", ".jpeg", ".avif") and ext.lower() != keep_ext.lower():
+            try:
+                os.remove(os.path.join(thumb_dir, name))
+            except OSError:
+                pass
+
+
+def _ffmpeg_bin(ffmpeg_dir) -> str | None:
+    """Return an ffmpeg executable path, or None."""
+    if ffmpeg_dir:
+        for name in ("ffmpeg.exe", "ffmpeg"):
+            p = os.path.join(ffmpeg_dir, name)
+            if os.path.isfile(p):
+                return p
+    return shutil.which("ffmpeg")
+
+
+def _thumb_exists(thumb_dir: str, stem: str) -> bool:
+    return any(os.path.isfile(os.path.join(thumb_dir, stem + ext))
+               for ext in (".png", ".jpg", ".jpeg", ".webp"))
+
+
+def _fetch_thumbnail(info, stem: str, thumb_dir: str, ffmpeg_dir, args) -> str | None:
+    """Download the video thumbnail and convert it to PNG (when ffmpeg exists)."""
+    url = info.get("thumbnail") or ""
+    if not url:
+        return None
+    data = b""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; YT-Batch-Downloader-Mistu)"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+    except Exception as exc:
+        log(f"  note: thumbnail fetch failed: {exc}")
+        return None
+    ext = ".png" if data.startswith(b"\x89PNG") else \
+          ".webp" if data.startswith(b"RIFF") else ".jpg"
+    src = os.path.join(thumb_dir, stem + ext)
+    try:
+        with open(src, "wb") as fh:
+            fh.write(data)
+    except OSError as exc:
+        log(f"  note: thumbnail save failed: {exc}")
+        return None
+    if ext == ".png":
+        return f"{stem}.png"
+    ffmpeg = _ffmpeg_bin(ffmpeg_dir)
+    if not ffmpeg:
+        return os.path.basename(src)          # keep original format (no ffmpeg)
+    dst = os.path.join(thumb_dir, stem + ".png")
+    try:
+        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-hide_banner",
+                        "-i", src, "-update", "1", dst],
+                       check=True, timeout=60)
+    except Exception as exc:
+        log(f"  note: thumbnail conversion to PNG failed ({exc}) — keeping {ext}")
+        return os.path.basename(src)
+    try:
+        os.remove(src)
+    except OSError:
+        pass
+    return f"{stem}.png"
+
+
+def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
+                      dirs: dict, item_no: int | None = None) -> tuple:
+    """Download audio + thumbnail + write info txt for one scanned video.
+    item_no is the file-number prefix (continues across sessions)."""
+    _check_cancel()
+    prefix = f"[{index}/{total}]"
+    safe = _clean_title(vid["title"])
+    stem = f"{item_no if item_no is not None else index}_{safe}"
+    audio_dir, thumb_dir, info_dir = dirs["audio"], dirs["thumb"], dirs["info"]
+    audio_dst = os.path.join(audio_dir, stem + ".%(ext)s")
+
+    # migrate: remove stray thumbnail files that old versions wrote into audio/
+    for _ext in (".png", ".jpg", ".jpeg", ".webp"):
+        _stray = os.path.join(audio_dir, stem + _ext)
+        if os.path.isfile(_stray):
+            try:
+                os.remove(_stray)
+            except OSError:
+                pass
+
+    # ---- thumbnails already saved for this item (resume) ----
+    audio_done = any(f.startswith(stem + ".") for f in os.listdir(audio_dir))
+    info_done = os.path.isfile(os.path.join(info_dir, stem + ".txt"))
+    thumb_done = _thumb_exists(thumb_dir, stem)
+
+    # ---- metadata ----
+    log(f"{prefix} ▸ {vid['title']} ({_fmt_dur(vid.get('duration'))})")
+    meta_opts = {
+        "quiet": not args.verbose,
+        "verbose": args.verbose,
+        "no_warnings": not args.verbose,
+        "socket_timeout": 30,
+        "extractor_retries": 3,
+    }
+    if args.cookies:
+        meta_opts["cookiefile"] = args.cookies
+    with yt_dlp.YoutubeDL(meta_opts) as ydl:
+        info = ydl.extract_info(vid["url"], download=False)
+    if not info:
+        return False, "metadata extraction failed"
+
+    if audio_done and info_done and thumb_done:
+        log(f"{prefix} ✓ skipped (already saved)")
+        return True, None
+
+    # ---- transcript (only if the info txt is missing) ----
+    if info_done:
+        t_lang, transcript = "", ""
+    else:
+        with tempfile.TemporaryDirectory(prefix="mistu-cap-") as capdir:
+            t_lang, transcript = _fetch_transcript(
+                vid["url"], ["en-orig", "en.*"], capdir, args)
+
+    # ---- audio (mp3/m4a/... via bundled ffmpeg) ----
+    if not audio_done:
+        audio_format = args.audio_format or "mp3"
+        post = []
+        if ffmpeg_dir:
+            post.append({"key": "FFmpegMetadata", "add_metadata": True})
+            post.append({
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": audio_format,
+                # mp3 → fixed 320 kbps CBR; other codecs keep 'best' handling
+                "preferredquality": "320" if audio_format == "mp3" else "0",
+            })
+        opts = {
+            "format": "bestaudio/best" if ffmpeg_dir else "bestaudio/best/best",
+            "outtmpl": audio_dst,
+            "writethumbnail": False,
+            "quiet": not args.verbose,
+            "verbose": args.verbose,
+            "no_warnings": not args.verbose,
+            "noprogress": True,
+            "progress_hooks": [make_hook(prefix, parallel=False)],
+            "retries": args.retries,
+            "socket_timeout": 30,
+            "extractor_retries": 3,
+            "postprocessors": post,
+        }
+        if ffmpeg_dir:
+            opts["ffmpeg_location"] = ffmpeg_dir
+        for _attempt in range(3):
+            _a_opts = opts
+            if _attempt:
+                _a_opts = dict(opts)
+                _a_opts["extractor_args"] = _PLAYER_FALLBACKS[_attempt - 1]
+            try:
+                with yt_dlp.YoutubeDL(_a_opts) as ydl:
+                    artist = getattr(args, "artist", None)
+                    song_title = getattr(args, "song_title", None)
+                    try:
+                        ydl.add_post_processor(
+                            _SetMusicMetaPP(ydl, artist=artist,
+                                            title=song_title),
+                            when="pre_process")
+                    except Exception:
+                        pass
+                    ydl.download([vid["url"]])
+                break
+            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
+                msg = str(exc).replace("\n", " ")
+                if msg.startswith("ERROR: "):
+                    msg = msg[len("ERROR: "):]
+                if _attempt < 2 and _RETRYABLE_RE.search(msg):
+                    _close_ytdlp_cache()
+                    log(f"{prefix} · hard block ({msg[:120]}) — retrying with "
+                        "an alternate player / fresh cache…")
+                    continue
+                raise
+        _bitrate = " @ 320 kbps" if audio_format == "mp3" else ""
+        log(f"{prefix} ✓ audio saved: Audio/{stem}.{audio_format}{_bitrate}")
+
+    # ---- thumbnail (separate folder, converted to PNG when ffmpeg exists) ----
+    if not thumb_done:
+        thumb_name = _fetch_thumbnail(info, stem, thumb_dir, ffmpeg_dir, args)
+        if thumb_name:
+            log(f"{prefix} ✓ thumbnail saved: Thumbnail/{thumb_name}")
+        elif not args.verbose:
+            log(f"{prefix} · thumbnail: none available")
+
+    # ---- info txt ----
+    if not info_done:
+        write_info_txt(os.path.join(info_dir, stem + ".txt"), vid, info, transcript, t_lang)
+        log(f"{prefix} ✓ info saved: Text File/{stem}.txt")
+    return True, None
+
+
+def run_scan(url: str, args, ffmpeg_dir) -> tuple:
+    """Full channel scan. Returns (ok_count, [(url, err), ...])."""
+    chan_name, videos = scan_channel(url, args)
+    longs = [v for v in videos if not v["short"]]
+    shorts = [v for v in videos if v["short"]]
+    log(f"· found {len(longs)} long video(s), {len(shorts)} short(s) — channel: {chan_name}")
+
+    # length filter: shorts are filtered with the same bounds
+    filtered = [v for v in videos if _length_ok(v.get("duration"), args.min_length, args.max_length)]
+    dropped = len(videos) - len(filtered)
+    if dropped:
+        lo = _fmt_dur(args.min_length) if args.min_length else "any"
+        hi = _fmt_dur(args.max_length) if args.max_length else "any"
+        log(f"· length filter {lo} … {hi}: {len(filtered)} of {len(videos)} kept ({dropped} skipped)")
+    if args.playlist_limit and args.playlist_limit > 0:
+        filtered = filtered[: args.playlist_limit]
+
+    if not filtered:
+        return 0, []
+
+    dest = os.path.abspath(args.dest)
+    dirs = {
+        "audio": os.path.join(dest, "Audio"),
+        "thumb": os.path.join(dest, "Thumbnail"),
+        "info": os.path.join(dest, "Text File"),
+    }
+    for d in dirs.values():
+        os.makedirs(d, exist_ok=True)
+    log(f"· output folder: {dest}")
+    log(f"· subfolders: Audio / Thumbnail / Text File")
+
+    # numbering: continue right after the numbers already on disk; a title
+    # that exists reuses its old number (resume), new titles get fresh ones
+    known, highest = _scan_prefixes(dirs)
+    next_no = highest + 1
+    if highest:
+        log(f"· found files up to #{highest} — numbering continues from #{next_no}")
+
+    ok_n, fails = 0, []
+    total = len(filtered)
+    for i, vid in enumerate(filtered, 1):
+        no = known.get(_clean_title(vid["title"]))
+        if no is None:
+            no = next_no
+            next_no += 1
+        if i > 1 and args.scan_delay and args.scan_delay > 0:
+            time.sleep(args.scan_delay)
+        try:
+            ok, err = process_scan_item(i, total, vid, args, ffmpeg_dir, dirs,
+                                        item_no=no)
+        except KeyboardInterrupt:
+            log(f"\n! interrupted at {i}/{total} — done items are kept; re-run to resume")
+            raise
+        except yt_dlp.utils.DownloadError as exc:
+            msg = str(exc).replace("\n", " ")
+            if msg.startswith("ERROR: "):
+                msg = msg[len("ERROR: "):]
+            if "not a bot" in msg or "429" in msg or "Too Many Requests" in msg:
+                msg += ("  [hint: YouTube is rate-limiting/throttling this IP — raise "
+                        "--scan-delay, wait some minutes, or pass --cookies cookies.txt]")
+            log(f"[{i}/{total}] ✗ FAILED: {msg[:200]}")
+            ok, err = False, msg
+        if ok:
+            ok_n += 1
+        else:
+            fails.append((vid["url"], err or "unknown error"))
+    return ok_n, fails
+
+
+def _is_channel_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    host = parsed.netloc.lower().removeprefix("www.")
+    path = parsed.path.lower().rstrip("/")
+    if host in ("youtube.com", "m.youtube.com"):
+        for marker in ("/@", "/channel/", "/c/", "/user/"):
+            if marker in path:
+                return True
+        if path.endswith(("/videos", "/shorts", "/streams")):
+            return True
+    if host.endswith("youtu.be"):
+        return False
+    return False
+
+
+def _scan_flat(url: str, args) -> tuple[str, list]:
+    """Flat-extract any URL (playlist / mix / single video). No download."""
+    opts = {
+        "quiet": not args.verbose,
+        "verbose": args.verbose,
+        "no_warnings": not args.verbose,
+        "extract_flat": True,
+        "socket_timeout": 30,
+        "extractor_retries": 3,
+        "ignoreerrors": True,
+    }
+    if getattr(args, "cookies", None):
+        opts["cookiefile"] = args.cookies
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info:
+        return url, []
+    name = info.get("title") or info.get("channel") or url
+    entries = info.get("entries")
+    if entries is None:                      # a single direct video URL
+        entries = [info]
+    videos = []
+    for e in entries or []:
+        if not e or not (e.get("id") or e.get("url")):
+            continue
+        vid = e.get("id") or ""
+        if e.get("ie_key") == "Youtube" and "/channel/" in (e.get("url") or ""):
+            continue                          # nested channel sub-listing
+        videos.append({
+            "id": vid,
+            "title": e.get("title") or vid,
+            "url": e.get("webpage_url") or e.get("url") or f"https://www.youtube.com/watch?v={vid}",
+            "duration": e.get("duration"),
+            "short": bool(e.get("shorts_only")),
+        })
+    return name, videos
+
+
+def _emit_scan_report(tag: str, name: str, url: str, videos: list, args) -> None:
+    """Log the detailed inventory for one scanned source."""
+    longs = [v for v in videos if not v["short"]]
+    shorts = [v for v in videos if v["short"]]
+    secs = sum(v["duration"] for v in videos if isinstance(v["duration"], (int, float)))
+
+    log(f"{tag} ────────────────────────────────────")
+    log(f"{tag} :: source: {url}")
+    log(f"{tag} :: name:   {name}")
+    log(f"{tag} :: total items: {len(videos)}"
+        f"   (videos: {len(longs)}, shorts: {len(shorts)}, runtime: {_fmt_dur(secs)})")
+
+    v_min, v_max = args.min_length, args.max_length
+    if v_min is not None or v_max is not None:
+        lo = _fmt_dur(v_min) if v_min else "any"
+        hi = _fmt_dur(v_max) if v_max else "any"
+        matched = [v for v in videos
+                   if _length_ok(v.get("duration"), v_min, v_max)]
+        log(f"{tag} :: length filter {lo} – {hi} → {len(matched)} item(s) within range"
+            f" ({len(videos) - len(matched)} outside range)")
+        listing = matched
+    else:
+        listing = videos
+
+    if getattr(args, "playlist_limit", 0) and args.playlist_limit > 0:
+        listing = listing[: args.playlist_limit]
+
+    if not listing:
+        log(f"{tag} :: (no items to list — nothing matched the filter)")
+        return
+
+    log(f"{tag} :: listing {len(listing)} item(s):")
+    for i, v in enumerate(listing, 1):
+        blurb = ("[short] " if v["short"] else "") + str(v["title"])
+        log(f"{tag}   {i:>4}. {_fmt_dur(v['duration']):>8}  {blurb}")
+
+
+def scan_report_pipeline(args) -> int:
+    """Dry-run: scan every target and log a detailed availability report.
+    Returns 0 ok, 1 some sources failed, 130 stopped by user."""
+    log("── SCAN REPORT ───────────────────────────────────────────────")
+    try:
+        fails = 0
+        targets = [t for t in args.targets if t]
+        for i, url in enumerate(targets, 1):
+            _check_cancel()
+            tag = f"[{i}/{len(targets)}]"
+            try:
+                if _is_channel_url(url):
+                    name, videos = scan_channel(url, args)
+                else:
+                    name, videos = _scan_flat(url, args)
+                if not videos:
+                    log(f"{tag} :: (No entries or a private/blocked source — "
+                        "cookies may be needed)")
+                    fails += 1
+                    continue
+                _emit_scan_report(tag, name, url, videos, args)
+            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
+                msg = str(exc).replace("\n", " ")
+                if msg.startswith("ERROR: "):
+                    msg = msg[len("ERROR: "):]
+                if "not a bot" in msg or "429" in msg or "Too Many Requests" in msg:
+                    msg += ("  [hint: use a cookies.txt file — see README §Cookies]")
+                log(f"{tag} ✗ scan failed: {msg[:260]}")
+                fails += 1
+        if fails:
+            log(f"── report finished with {fails} failed source(s)")
+            return 1
+        log("── report finished ✔")
+        return 0
+    except RunCancelled:
+        log("! scan report stopped by user")
+        return 130
+
+
+# ----------------------------------------------------------- update yt-dlp ---
+def update_ytdlp() -> bool:
+    """Update yt-dlp via pip using the current interpreter. Returns True on success."""
+    log("· updating yt-dlp via pip (this may take a minute)…")
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade",
+             "--break-system-packages", "yt-dlp"],
+            capture_output=True, text=True,
+        )
+        if proc.stdout and proc.stdout.strip():
+            for line in proc.stdout.strip().splitlines():
+                log(line)
+        if proc.stderr and proc.stderr.strip():
+            for line in proc.stderr.strip().splitlines():
+                log(line)
+        if proc.returncode != 0:
+            log(f"✗ yt-dlp update failed (exit code {proc.returncode})")
+            return False
+        try:
+            import importlib
+            importlib.reload(yt_dlp)
+            log(f"✓ yt-dlp updated to {yt_dlp.version.__version__}")
+        except Exception:
+            log("✓ yt-dlp update completed")
+        return True
+    except Exception as exc:
+        log(f"✗ yt-dlp update failed: {exc}")
+        return False
+
+
+# -------------------------------------------------------------------- main ---
+BANNER = r"""
+====================================================
+  YT-Batch-Downloader-Mistu  v{ver}
+  YouTube batch downloader •  engine: yt-dlp {ydlp}
+====================================================
+"""
+
+
+def execute(args) -> int:
+    """Run the full pipeline for parsed args. Usable from the CLI and the GUI.
+    Returns 0 = all ok, 1 = some failures, 130 = stopped by user, 2 = bad input."""
+    if getattr(args, "update_ytdlp", False):
+        return 0 if update_ytdlp() else 1
+    # --mode selects a download mode
+    _mode = getattr(args, "mode", None)
+    if _mode == "scan":
+        args.scan = True
+        args.regular = False
+        args.music = False
+    elif _mode == "regular":
+        args.regular = True
+        args.scan = False
+        args.music = False
+    elif _mode == "music":
+        args.music = True
+
+    # Music mode = the best-audio system:
+    #   best available audio stream -> mp3 @ 320 kbps, cover art + tags
+    if getattr(args, "music", False):
+        args.quality = "audio"
+        args.audio_format = "mp3"          # the best-audio system is mp3-only
+        args.no_meta = False               # tags/cover art are always embedded
+        args.no_thumb = False              # in the best-audio system
+        args.regular = True
+    ffmpeg_dir = find_ffmpeg()
+    if ffmpeg_dir:
+        log(f"· ffmpeg: {ffmpeg_dir}")
+    else:
+        log("· ffmpeg: NOT FOUND")
+        if args.quality != "audio" or getattr(args, "music", False):
+            log("error: ffmpeg is required for this mode "
+                "(audio conversion / cover-art embedding).\n"
+                "  - the installed app ships ffmpeg next to the program,\n"
+                "  - or keep ffmpeg.exe/ffmpeg on PATH.")
+            return 2
+
+    try:
+        urls = collect_urls(args.targets, dedupe=not args.keep_dupes)
+    except OSError as exc:
+        sys.stderr.write(f"error: cannot read input file: {exc}\n")
+        return 2
+
+    if not urls:
+        log("error: no URLs given")
+        return 2
+
+    if args.no_archive or args.redo:
+        archive = None
+    elif args.archive:
+        archive = args.archive
+    else:
+        archive = os.path.join(args.dest, "downloaded.txt")
+
+    dest = os.path.abspath(args.dest)
+    os.makedirs(dest, exist_ok=True)
+
+    if getattr(args, "regular", False):
+        scan_urls = []
+    else:
+        scan_urls = [u for u in urls if args.scan or looks_like_channel(u)]
+    scan_set = set(scan_urls)
+    batch_urls = [u for u in urls if u not in scan_set]
+
+    if scan_urls:
+        log(f"· channel URLs detected -> scan mode: {len(scan_urls)}")
+        if batch_urls:
+            log(f"· plain URLs (batch mode): {len(batch_urls)}")
+    if batch_urls:
+        pl = [u for u in batch_urls if "list=" in u.lower() or "/playlist" in u.lower()]
+        if pl:
+            log(f"· playlist URL(s) detected: {len(pl)} (downloads all items by default; "
+                f"use --single/--no-playlist for one video)")
+        log(f"· destination: {dest}")
+        log(f"· items: {len(batch_urls)}   quality: {args.quality}   jobs: {args.jobs}")
+        if archive and not args.redo:
+            log(f"· archive: {archive}  (already-downloaded items will be skipped)")
+    log("-" * 52)
+
+    failures = []
+    ok_count = 0
+    try:
+        if batch_urls:
+            total_b = len(batch_urls)
+            if args.jobs == 1:
+                for i, url in enumerate(batch_urls, 1):
+                    _check_cancel()
+                    ok, err = download_one(i, total_b, url, args, ffmpeg_dir, archive)
+                    if ok:
+                        ok_count += 1
+                    else:
+                        failures.append((url, err or "unknown error"))
+            else:
+                with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+                    futures = {
+                        pool.submit(download_one, i, total_b, u, args, ffmpeg_dir, archive): u
+                        for i, u in enumerate(batch_urls, 1)
+                    }
+                    try:
+                        for fut in as_completed(futures):
+                            ok, err = fut.result()
+                            if ok:
+                                ok_count += 1
+                            else:
+                                failures.append((futures[fut], err or "unknown error"))
+                            if _CANCEL_LATCH.is_set():
+                                for f in futures:
+                                    f.cancel()
+                                break
+                    except KeyboardInterrupt:
+                        log("\n! interrupted — waiting for running downloads to finish…")
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        return 130
+                if _CANCEL_LATCH.is_set():
+                    raise RunCancelled()
+
+        for s_url in scan_urls:
+            _check_cancel()
+            s_ok, s_fails = run_scan(s_url, args, ffmpeg_dir)
+            ok_count += s_ok
+            failures.extend(s_fails)
+    except RunCancelled:
+        log("\n! stopped by user — completed items are kept; a re-run resumes")
+        return 130
+
+    log("-" * 52)
+    log(f"summary: {ok_count} succeeded, {len(failures)} failed, "
+        f"saved to: {dest}")
+    if failures:
+        log("failed items:")
+        for url, err in failures:
+            log(f"  ✗ {url}  ({err[:120]})")
+        return 1
+    return 0
+
+
+def main(argv=None) -> int:
+    _force_utf8_stdio()
+    args = parse_args(argv)
+    log(BANNER.format(ver=__version__, ydlp=yt_dlp.version.__version__).lstrip("\n"))
+    try:
+        return execute(args)
+    except KeyboardInterrupt:
+        log("\n! interrupted — completed items are kept")
+        return 130
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        log("\n! interrupted")
+        raise SystemExit(130)
