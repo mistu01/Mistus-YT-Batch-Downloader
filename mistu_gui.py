@@ -498,7 +498,10 @@ class App(tk.Tk):
         # ------------------------------------------- download options ---
         oc = Card(page)
         oc.pack(fill="x", padx=20, pady=6)
-        self._head(oc.frame, "Output & options", bg=BLUE)
+        self._head(oc.frame, "Output & options",
+                   "cookies: pick a cookies.txt file — or type 'firefox' / "
+                   "'chrome' / 'edge' to use that browser's LIVE cookies "
+                   "(never stale, best for big batches)", bg=BLUE)
 
         r1 = tk.Frame(oc.frame, bg=CARD)
         r1.pack(fill="x", pady=(8, 0))
@@ -552,7 +555,7 @@ class App(tk.Tk):
 
         r3 = tk.Frame(oc.frame, bg=CARD)
         r3.pack(fill="x", pady=(14, 0))
-        tk.Label(r3, text="COOKIES.TXT (OPTIONAL):", bg=CARD, fg=INK,
+        tk.Label(r3, text="COOKIES:", bg=CARD, fg=INK,
                  font=FONT_SM_B).pack(side="left")
         self.cookies_var = tk.StringVar(value="")
         BrutEntry(r3, self.cookies_var, 40).pack(side="left", fill="x",

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -25,7 +26,7 @@ from concurrent.futures import TimeoutError as FutTimeout  # noqa: F401 (reserve
 from urllib.parse import urlparse
 import urllib.request
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -409,7 +410,7 @@ def build_ydl_opts(args, ffmpeg_dir, archive, hook):
         opts["writesubtitles"] = True
         opts["subtitleslangs"] = [s.strip() for s in args.subs_langs.split(",") if s.strip()]
     if args.cookies:
-        opts["cookiefile"] = args.cookies
+        opts.update(cookieopts(args))
     return opts
 
 
@@ -424,61 +425,76 @@ def _item_title(d) -> str:
 
 
 def make_hook(prefix: str, parallel: bool):
-    """progress hook — inline bar (sequential) or sparse lines (parallel)."""
+    """progress hook — inline bar (CLI) or sparse Activity lines (GUI);
+    the GUI parses these lines into the big progress bar."""
     state = {"pct": -100.0}
-
-    def report_downloading(d):
-        title = _item_title(d)
-        got = d.get("downloaded_bytes") or 0
-        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-        speed, eta = d.get("speed"), d.get("eta")
-        if total > 0:
-            pct = got * 100.0 / total
-        else:
-            pct = None
-
-        head = f"{prefix} {title}"
-        if parallel:
-            # sparse full-line updates to keep multi-thread output readable
-            show = pct is None or pct >= state["pct"] + 5.0 or pct >= 100.0
-            if not show:
-                return
-            state["pct"] = pct if pct is not None else state["pct"]
-            body = (f"… {pct:5.1f}%" if pct is not None else f"… {human_size(got)}")
-            extra = f" ({human_size(got)}/{human_size(total)})" if total else ""
-            log(f"{head} {body}{extra}")
-            return
-
-        w = term_width()
-        if pct is not None:
-            filled = min(24, int(pct / 100.0 * 24))
-            bar = "#" * filled + "-" * (24 - filled)
-            line = f"{head:<48.48} [{bar}] {pct:5.1f}% {human_size(got)}" \
-                   + (f"/{human_size(total)}" if total else "")
-        else:
-            line = f"{head:<48.48} [--------]  ??% {human_size(got)}"
-        if speed:
-            line += f" {human_size(speed)}/s"
-        if eta:
-            line += f" ETA {human_time(eta)}"
-        with PRINT_LOCK:
-            try:
-                print("\r" + line[:w] + " " * max(0, w - (len(line) + 2)), end="", flush=True)
-            except Exception:
-                pass
 
     def hook(d):
         if _CANCEL_LATCH.is_set():
             # Stop works mid-download: hooks run tight in the transfer loop
             raise RunCancelled()
         status = d.get("status")
-        if status == "downloading":
-            report_downloading(d)
-        elif status == "finished" and not parallel:
+
+        if status == "downloading" and _LOG is not None:
+            # GUI mode: sparse >=5%-step lines so the log stays readable
             title = _item_title(d)
+            got = d.get("downloaded_bytes") or 0
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            if total > 0:
+                pct = got * 100.0 / total
+            else:
+                pct = None
+            if pct is None:
+                if state["pct"] < 0:
+                    state["pct"] = 0.0
+                    log(f"{prefix} … {human_size(got)}"
+                        f"{'' if parallel else ' (size unknown)'}")
+                return
+            if pct < state["pct"] + 5.0 and pct < 99.0:
+                return
+            state["pct"] = pct
+            speed, eta = d.get("speed"), d.get("eta")
+            body = (f"{pct:5.1f}%  {human_size(got)}"
+                    + (f"/{human_size(total)}" if total else ""))
+            if speed:
+                body += f"  {human_size(speed)}/s"
+            if eta:
+                body += f"  ETA {human_time(eta)}"
+            log(f"{prefix} … {body}")
+            return
+
+        if status == "downloading":
+            title = _item_title(d)
+            got = d.get("downloaded_bytes") or 0
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            speed, eta = d.get("speed"), d.get("eta")
+            pct = (got * 100.0 / total) if total > 0 else None
+            w = term_width()
+            if pct is not None:
+                filled = min(24, int(pct / 100.0 * 24))
+                bar = "#" * filled + "-" * (24 - filled)
+                line = f"{prefix} {title:<48.48} [{bar}] {pct:5.1f}% {human_size(got)}" \
+                       + (f"/{human_size(total)}" if total else "")
+            else:
+                line = f"{prefix} {title:<48.48} [--------]  ??% {human_size(got)}"
+            if speed:
+                line += f" {human_size(speed)}/s"
+            if eta:
+                line += f" ETA {human_time(eta)}"
             with PRINT_LOCK:
-                print(f"\r{prefix} {title:<48.48} [########################] 100.0%"
-                      f" — merging / processing…", flush=True)
+                try:
+                    print("\r" + line[:w] + " " * max(0, w - (len(line) + 2)),
+                          end="", flush=True)
+                except Exception:
+                    pass
+        elif status == "finished":
+            if _LOG is not None:
+                log(f"{prefix} … 100.0% — converting / merging…")
+            elif not parallel:
+                title = _item_title(d)
+                with PRINT_LOCK:
+                    print(f"\r{prefix} {title:<48.48} [########################] 100.0%"
+                          f" — merging / processing…", flush=True)
     return hook
 
 
@@ -577,7 +593,7 @@ def _with_player_fallbacks(base_opts: dict, prefix: str, run):
     between passes. Raises the last error when every pass fails;
     RunCancelled / KeyboardInterrupt pass through untouched."""
     passes = _all_passes()
-    ckey = str(base_opts.get("cookiefile") or "")
+    ckey = _session_key(base_opts)
     win = _signature_index(_adaptive_load(ckey))
     if win == 0:
         win = None
@@ -592,6 +608,7 @@ def _with_player_fallbacks(base_opts: dict, prefix: str, run):
             opts["extractor_args"] = clients
             if drop_cookies:
                 opts.pop("cookiefile", None)
+                opts.pop("cookiesfrombrowser", None)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 result = run(ydl)
@@ -624,6 +641,41 @@ def _close_ytdlp_cache():
         cdir = None
     if cdir and os.path.isdir(cdir):
         shutil.rmtree(cdir, ignore_errors=True)
+
+
+_BROWSER_NAMES = ("firefox", "chrome", "chromium", "edge", "brave",
+                  "opera", "safari", "vivaldi", "whale")
+
+
+def _is_browser_cookie(value) -> bool:
+    return bool(value) and value.strip().lower() in _BROWSER_NAMES
+
+
+def cookieopts(args) -> dict:
+    """Cookie options for the ydl opts dict. Accepts a cookies.txt PATH or
+    a live browser NAME (firefox/chrome/edge/...). Live browser cookies are
+    the reliable long-run choice: they never expire between runs (a stale
+    exports-file is the #1 cause of blocks on big batches)."""
+    c = getattr(args, "cookies", None)
+    if not c:
+        return {}
+    if _is_browser_cookie(c):
+        return {"cookiesfrombrowser": (c.strip().lower(),)}
+    return {"cookiefile": c}
+
+
+def _session_key(opts: dict) -> str:
+    """Marker used for the adaptive player memory (cookie-file or browser)."""
+    return str(opts.get("cookiefile")
+               or (opts.get("cookiesfrombrowser") or ("",""))[0]
+               or "")
+
+
+def _delay_jitter(delay: float) -> float:
+    """scan delay with ±25% jitter — fixed intervals look robotic."""
+    if delay and delay > 0:
+        return max(2.0, delay * (0.75 + 0.5 * random.random()))
+    return 0.0
 
 
 def download_one(index: int, total: int, url: str, args, ffmpeg_dir, archive) -> tuple:
@@ -715,7 +767,7 @@ def scan_channel(url: str, args) -> tuple[str, list]:
         "logger": None,
     }
     if args.cookies:
-        scan_opts["cookiefile"] = args.cookies
+        scan_opts.update(cookieopts(args))
     if args.playlist_limit and args.playlist_limit > 0:
         scan_opts["playlistend"] = args.playlist_limit
     for tab in _channel_tab_urls(url, include_shorts=args.shorts):
@@ -910,7 +962,7 @@ def _fetch_transcript(url: str, langs: list, workdir: str, args) -> tuple[str, s
         "extractor_retries": 3,
     }
     if args.cookies:
-        opts["cookiefile"] = args.cookies
+        opts.update(cookieopts(args))
     try:
         _with_player_fallbacks(opts, "  ", lambda ydl: ydl.download([url]))
     except Exception as exc:
@@ -1057,7 +1109,7 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
         "extractor_retries": 3,
     }
     if args.cookies:
-        meta_opts["cookiefile"] = args.cookies
+        meta_opts.update(cookieopts(args))
     # cookie state can poison the watch page ("page needs to be reloaded")
     # — reach for the same player-client ladder the downloads use
     info = _with_player_fallbacks(
@@ -1180,8 +1232,9 @@ def run_scan(url: str, args, ffmpeg_dir) -> tuple:
             no = next_no
             next_no += 1
         if i > 1 and args.scan_delay and args.scan_delay > 0:
-            # latch-based sleep: pressing Stop cuts the delay instantly
-            if _CANCEL_LATCH.wait(args.scan_delay):
+            # jittered latch sleep: pressing Stop cuts the delay instantly
+            wait = _delay_jitter(args.scan_delay)
+            if wait and _CANCEL_LATCH.wait(wait):
                 _check_cancel()
         try:
             ok, err = process_scan_item(i, total, vid, args, ffmpeg_dir, dirs,
@@ -1235,7 +1288,7 @@ def _scan_flat(url: str, args) -> tuple[str, list]:
         "ignoreerrors": True,
     }
     if getattr(args, "cookies", None):
-        opts["cookiefile"] = args.cookies
+        opts.update(cookieopts(args))
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if not info:
@@ -1484,11 +1537,22 @@ def execute(args) -> int:
 
     # cookie transparency: show the user exactly what will be used
     if getattr(args, "cookies", None):
-        cinfo, cprob = _describe_cookies(args.cookies)
-        if cinfo:
-            log(f"· cookies: {args.cookies}  ({cinfo})")
-        if cprob:
-            log(f"· cookies: {args.cookies}  ⚠ {cprob}")
+        if _is_browser_cookie(args.cookies):
+            log(f"· cookies: live browser session via {args.cookies.strip()} "
+                "(always fresh — best choice for long runs)")
+        else:
+            cinfo, cprob = _describe_cookies(args.cookies)
+            if cinfo:
+                log(f"· cookies: {args.cookies}  ({cinfo})")
+            if cprob:
+                log(f"· cookies: {args.cookies}  ⚠ {cprob}")
+    _jsnotes = [_x for _x in ("deno", "bun", "node")
+                if shutil.which(_x)]
+    if _jsnotes:
+        log(f"· js runtime: {_jsnotes[0]} (ok)")
+    else:
+        log("· js runtime: none found — occasional format errors may occur; "
+            "install once with  winget install OpenJS.NodeJS.LTS  to be safe")
 
     if getattr(args, "regular", False):
         scan_urls = []
@@ -1552,7 +1616,7 @@ def execute(args) -> int:
         for ci, s_url in enumerate(scan_urls):
             if ci and args.scan_delay and args.scan_delay > 0:
                 # breathe between channels too (latch wait = instant stop)
-                if _CANCEL_LATCH.wait(args.scan_delay):
+                if _CANCEL_LATCH.wait(_delay_jitter(args.scan_delay)):
                     _check_cancel()
             _check_cancel()
             s_ok, s_fails = run_scan(s_url, args, ffmpeg_dir)
