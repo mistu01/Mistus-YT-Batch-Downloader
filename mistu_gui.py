@@ -499,9 +499,10 @@ class App(tk.Tk):
         oc = Card(page)
         oc.pack(fill="x", padx=20, pady=6)
         self._head(oc.frame, "Output & options",
-                   "cookies: pick a cookies.txt file — or type 'firefox' / "
-                   "'chrome' / 'edge' to use that browser's LIVE cookies "
-                   "(never stale, best for big batches)", bg=BLUE)
+                   "cookies: pick a cookies.txt file — or type a browser's "
+                   "name for its LIVE cookies ('firefox', 'chrome', 'edge'; "
+                   "multi-profile: 'chrome:Profile 2', 'chrome:Work' or "
+                   "'chrome:2') — never stale, best for big batches", bg=BLUE)
 
         r1 = tk.Frame(oc.frame, bg=CARD)
         r1.pack(fill="x", pady=(8, 0))

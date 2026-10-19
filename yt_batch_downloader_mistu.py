@@ -26,7 +26,7 @@ from concurrent.futures import TimeoutError as FutTimeout  # noqa: F401 (reserve
 from urllib.parse import urlparse
 import urllib.request
 
-__version__ = "2.5.0"
+__version__ = "2.5.1"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -646,29 +646,74 @@ def _close_ytdlp_cache():
 _BROWSER_NAMES = ("firefox", "chrome", "chromium", "edge", "brave",
                   "opera", "safari", "vivaldi", "whale")
 
+_CHROMIUM_BROWSERS = ("chrome", "chromium", "edge", "brave",
+                      "opera", "vivaldi", "whale")
+
+
+def _parse_browser_cookie(value):
+    """'firefox' / 'chrome:Profile 2' / 'chrome:Work' / 'chrome:2'
+    -> (browser, profile-or-None). None when the value is not a browser."""
+    v = (value or "").strip()
+    name, _, prof = v.partition(":")
+    name = name.strip().lower()
+    if name not in _BROWSER_NAMES:
+        return None
+    prof = prof.strip() or None
+    if prof and name in _CHROMIUM_BROWSERS:
+        prof = _resolve_chromium_profile(name, prof)
+    return name, prof
+
+
+def _resolve_chromium_profile(name: str, prof: str) -> str:
+    """Match a stand-in profile against the browser's real folders.
+    Accepts case-insensitive folder names ('profile 2'), DISPLAY names
+    chosen in Chrome ('Work') and 1-based index numbers ('2')."""
+    try:
+        from yt_dlp.cookies import _get_chromium_based_browser_settings
+        root = _get_chromium_based_browser_settings(name)["browser_dir"]
+        with open(os.path.join(root, "Local State"),
+                  "r", encoding="utf-8", errors="replace") as fh:
+            info = json.load(fh).get("profile", {}).get("info_cache") or {}
+    except Exception:
+        return prof
+    if not info:
+        return prof
+    folders = sorted(info.keys())
+    if prof.lower() in (f.lower() for f in folders):
+        return next(f for f in folders if f.lower() == prof.lower())
+    for folder, meta in info.items():                 # display name match
+        if str(meta.get("name", "")).strip().lower() == prof.lower():
+            return folder
+    if prof.isdigit():                                # '2' → 2nd profile
+        if 1 <= int(prof) <= len(folders):
+            return folders[int(prof) - 1]
+    return prof
+
 
 def _is_browser_cookie(value) -> bool:
-    return bool(value) and value.strip().lower() in _BROWSER_NAMES
+    return _parse_browser_cookie(value) is not None
 
 
 def cookieopts(args) -> dict:
     """Cookie options for the ydl opts dict. Accepts a cookies.txt PATH or
-    a live browser NAME (firefox/chrome/edge/...). Live browser cookies are
-    the reliable long-run choice: they never expire between runs (a stale
-    exports-file is the #1 cause of blocks on big batches)."""
+    a live browser NAME (firefox / chrome / chrome:Profile 2 / …). Live
+    browser cookies are the reliable long-run choice: they never expire
+    between runs (a stale export file is the #1 long-run error source)."""
     c = getattr(args, "cookies", None)
     if not c:
         return {}
-    if _is_browser_cookie(c):
-        return {"cookiesfrombrowser": (c.strip().lower(),)}
+    parsed = _parse_browser_cookie(c)
+    if parsed:
+        return {"cookiesfrombrowser": parsed}
     return {"cookiefile": c}
 
 
 def _session_key(opts: dict) -> str:
     """Marker used for the adaptive player memory (cookie-file or browser)."""
-    return str(opts.get("cookiefile")
-               or (opts.get("cookiesfrombrowser") or ("",""))[0]
-               or "")
+    cb = opts.get("cookiesfrombrowser")
+    if cb:
+        return ":".join(str(x) for x in cb if x is not None)
+    return str(opts.get("cookiefile") or "")
 
 
 def _delay_jitter(delay: float) -> float:
@@ -1536,16 +1581,18 @@ def execute(args) -> int:
     os.makedirs(dest, exist_ok=True)
 
     # cookie transparency: show the user exactly what will be used
-    if getattr(args, "cookies", None):
-        if _is_browser_cookie(args.cookies):
-            log(f"· cookies: live browser session via {args.cookies.strip()} "
-                "(always fresh — best choice for long runs)")
-        else:
-            cinfo, cprob = _describe_cookies(args.cookies)
-            if cinfo:
-                log(f"· cookies: {args.cookies}  ({cinfo})")
-            if cprob:
-                log(f"· cookies: {args.cookies}  ⚠ {cprob}")
+    bb = _parse_browser_cookie(getattr(args, "cookies", None))
+    if bb:
+        _bname, _bprof = bb
+        log(f"· cookies: live browser session via {_bname}"
+            + (f" (profile '{_bprof}')" if _bprof else " (default profile)")
+            + " — always fresh, best for long runs")
+    elif getattr(args, "cookies", None):
+        cinfo, cprob = _describe_cookies(args.cookies)
+        if cinfo:
+            log(f"· cookies: {args.cookies}  ({cinfo})")
+        if cprob:
+            log(f"· cookies: {args.cookies}  ⚠ {cprob}")
     _jsnotes = [_x for _x in ("deno", "bun", "node")
                 if shutil.which(_x)]
     if _jsnotes:
