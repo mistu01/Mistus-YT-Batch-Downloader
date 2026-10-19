@@ -11,6 +11,7 @@ No installation required — the build script produces a self-contained zip.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -24,7 +25,7 @@ from concurrent.futures import TimeoutError as FutTimeout  # noqa: F401 (reserve
 from urllib.parse import urlparse
 import urllib.request
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -467,6 +468,9 @@ def make_hook(prefix: str, parallel: bool):
                 pass
 
     def hook(d):
+        if _CANCEL_LATCH.is_set():
+            # Stop works mid-download: hooks run tight in the transfer loop
+            raise RunCancelled()
         status = d.get("status")
         if status == "downloading":
             report_downloading(d)
@@ -499,30 +503,92 @@ _PLAYER_FALLBACKS = [
 ]
 
 
+def _all_passes() -> list:
+    """Every attempt in full ladder order — index 0 = 'as configured'."""
+    return [(None, False)] + list(_PLAYER_FALLBACKS)
+
+
+_PLAYER_NAMES = {
+    0: "yt-dlp default",
+    1: "android + web_safari",
+    2: "tv_simply",
+    3: "android + web_safari (no cookies)",
+}
+
+# Adaptive memory: on a poisoned session the FIRST item can burn the whole
+# ladder before something works; remember the winning pass so the remaining
+# items — and the next app session — start there directly.
+_ADAPTIVE_PATH = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")),
+    "MistusBatchYTDownloader", "adaptive.json")
+_ADAPTIVE_MEMO: dict = {}
+
+
+def _adaptive_load(cookiefile: str):
+    """Remembered winning pass idx for this cookie file (None = no memory)."""
+    key = cookiefile or ""
+    if key not in _ADAPTIVE_MEMO:
+        val = None
+        try:
+            with open(_ADAPTIVE_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if data.get("cookiefile", "") == key:
+                val = int(data.get("win", -1))
+                if not (0 <= val < len(_all_passes())):
+                    val = None
+        except Exception:
+            val = None
+        _ADAPTIVE_MEMO[key] = val
+    return _ADAPTIVE_MEMO[key]
+
+
+def _adaptive_save(cookiefile: str, win: int | None) -> None:
+    _ADAPTIVE_MEMO[cookiefile or ""] = win
+    try:
+        os.makedirs(os.path.dirname(_ADAPTIVE_PATH), exist_ok=True)
+        with open(_ADAPTIVE_PATH, "w", encoding="utf-8") as fh:
+            json.dump({"cookiefile": cookiefile or "", "win": win}, fh)
+    except Exception:
+        pass
+
+
 def _with_player_fallbacks(base_opts: dict, prefix: str, run):
     """Run `run(ydl)` across player-client passes when YouTube hard-blocks.
 
-    Ladder: as configured -> android/web_safari -> tv_simply again but
-    cookieless (fresh cache between passes). Raises the last error when
-    every pass fails; KeyboardInterrupt passes through untouched."""
-    for attempt in range(len(_PLAYER_FALLBACKS) + 1):
+    Order: the previously-learned winning pass (if any), then the configured
+    pass, then the client ladder — final pass runs cookieless. Fresh cache
+    between passes. Throws the last error when every pass fails;
+    RunCancelled / KeyboardInterrupt pass through untouched."""
+    passes = _all_passes()
+    ckey = str(base_opts.get("cookiefile") or "")
+    win = _adaptive_load(ckey)
+    order = ([win] if win is not None else []) + \
+            [i for i in range(len(passes)) if i != win]
+    for pos in order:
+        _check_cancel()
         opts = base_opts
-        if attempt:
+        clients, drop_cookies = passes[pos]
+        if clients is not None:
             opts = dict(base_opts)
-            clients, drop_cookies = _PLAYER_FALLBACKS[attempt - 1]
             opts["extractor_args"] = clients
             if drop_cookies:
                 opts.pop("cookiefile", None)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                return run(ydl)
+                result = run(ydl)
+            if pos != 0 and _ADAPTIVE_MEMO.get(ckey) != pos:
+                _adaptive_save(ckey, pos)
+                log(f"{prefix} · learned: {_PLAYER_NAMES.get(pos, pos)} "
+                    "works in this session — trying it first from now on")
+            return result
         except KeyboardInterrupt:
             raise
         except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
             msg = str(exc).replace("\n", " ")
             if msg.startswith("ERROR: "):
                 msg = msg[len("ERROR: "):]
-            if attempt < len(_PLAYER_FALLBACKS) and _RETRYABLE_RE.search(msg):
+            remaining = order[order.index(pos) + 1:]
+            if remaining and _RETRYABLE_RE.search(msg):
                 _close_ytdlp_cache()
                 log(f"{prefix} · hard block ({msg[:120]}) — retrying with an "
                     "alternate player / fresh cache…")
@@ -568,6 +634,9 @@ def download_one(index: int, total: int, url: str, args, ffmpeg_dir, archive) ->
         return True, None
     except KeyboardInterrupt:
         log(f"{prefix} ! interrupted")
+        raise
+    except RunCancelled:
+        log(f"{prefix} ■ stopped by user")
         raise
     except yt_dlp.utils.DownloadError as exc:
         msg = str(exc).replace("\n", " ")
@@ -1031,7 +1100,9 @@ def run_scan(url: str, args, ffmpeg_dir) -> tuple:
             no = next_no
             next_no += 1
         if i > 1 and args.scan_delay and args.scan_delay > 0:
-            time.sleep(args.scan_delay)
+            # latch-based sleep: pressing Stop cuts the delay instantly
+            if _CANCEL_LATCH.wait(args.scan_delay):
+                _check_cancel()
         try:
             ok, err = process_scan_item(i, total, vid, args, ffmpeg_dir, dirs,
                                         item_no=no)

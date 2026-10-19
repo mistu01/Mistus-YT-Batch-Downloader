@@ -14,6 +14,7 @@ Launched without a console via pythonw.exe.
 from __future__ import annotations
 
 import os
+import json
 import queue
 import re
 import sys
@@ -559,6 +560,35 @@ class App(tk.Tk):
         BrutButton(r3, "…", self.browse_cookies, bg=BTN2, hover=BTN2_H,
                    padx=10).pack(side="left")
 
+        # --------------------------------------------------- sessions ---
+        sesc = Card(page)
+        sesc.pack(fill="x", padx=20, pady=6)
+        self._head(sesc.frame, "Sessions",
+                   "Auto-saved as \u201clast session\u201d on exit and restored "
+                   "on start. Save named sessions to switch between "
+                   "video / playlist / music projects.", bg=ORANGE)
+        srow = tk.Frame(sesc.frame, bg=CARD)
+        srow.pack(fill="x", pady=(8, 2))
+        tk.Label(srow, text="SAVE AS:", bg=CARD, fg=INK, font=FONT_SM_B)\
+            .pack(side="left")
+        self.session_name_var = tk.StringVar(value="")
+        BrutEntry(srow, self.session_name_var, 18).pack(side="left",
+                                                        padx=(6, 12))
+        BrutButton(srow, "💾 SAVE SESSION", self.save_session, bg=LIME,
+                   hover="#b1f76e", padx=14).pack(side="left")
+        tk.Label(srow, text="SAVED:", bg=CARD, fg=INK,
+                 font=FONT_SM_B).pack(side="left", padx=(16, 0))
+        self.session_pick_var = tk.StringVar(value="")
+        self.session_cb = ttk.Combobox(srow, textvariable=self.session_pick_var,
+                                       values=self._list_sessions(),
+                                       state="readonly", width=20,
+                                       style="Mist.TCombobox")
+        self.session_cb.pack(side="left", padx=(6, 10))
+        BrutButton(srow, "♻ LOAD", self.load_session, bg=BLUE,
+                   hover="#9ccbff", padx=12).pack(side="left")
+        BrutButton(srow, "🗑 DELETE", self.delete_session, bg=BTN3,
+                   hover=BTN3_H, padx=12).pack(side="left", padx=(10, 0))
+
         # --------------------------------------------------- advanced ---
         ac = Card(page)
         ac.pack(fill="x", padx=20, pady=(6, 24))
@@ -610,6 +640,7 @@ class App(tk.Tk):
         p_cb.bind("<<ComboboxSelected>>", self._apply_preset)
 
         self._bind_wheel()
+        self._restore_last_session()
 
     # ------------------------------------------------- wheel rebinding ---
     def _bind_wheel(self):
@@ -650,6 +681,163 @@ class App(tk.Tk):
                 self.scan_opts.pack_forget()
         if hasattr(self, "_wheel_scroll"):
             self._bind_wheel()
+
+    # ------------------------------------------------------ sessions -----
+    def _app_dir(self) -> str:
+        """%APPDATA%\\MistusBatchYTDownloader — survives app updates."""
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        d = os.path.join(base, "MistusBatchYTDownloader")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _sessions_dir(self) -> str:
+        d = os.path.join(self._app_dir(), "sessions")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _last_session_path(self) -> str:
+        return os.path.join(self._app_dir(), "last_session.json")
+
+    def _list_sessions(self) -> list:
+        try:
+            return sorted(f[:-5] for f in os.listdir(self._sessions_dir())
+                          if f.endswith(".json"))
+        except Exception:
+            return []
+
+    def _capture_state(self) -> dict:
+        """Every knob that defines a session."""
+        return {
+            "mode": self.mode_var.get(),
+            "urls": self.url_text.get("1.0", "end").rstrip("\n"),
+            "artist": self.artist_var.get(),
+            "song": self.songtitle_var.get(),
+            "shorts": self.shorts_var.get(),
+            "forcescan": self.forcescan_var.get(),
+            "dest": self.dest_var.get(),
+            "quality": self.quality_var.get(),
+            "audio_fmt": self.fmt_var.get(),
+            "delay": self.delay_var.get(),
+            "timelimit": self.timelimit_var.get(),
+            "minlen": self.minlen_var.get(),
+            "maxlen": self.maxlen_var.get(),
+            "limit": self.limit_var.get(),
+            "jobs": self.jobs_var.get(),
+            "cookies": self.cookies_var.get(),
+            "subs": self.subs_var.get(),
+            "subslangs": self.subslangs_var.get(),
+            "nothumb": self.nothumb_var.get(),
+            "nometa": self.nometa_var.get(),
+            "noplaylist": self.noplaylist_var.get(),
+            "keepdupes": self.keepdupes_var.get(),
+            "noarchive": self.noarchive_var.get(),
+            "redo": self.redo_var.get(),
+            "verbose": self.verbose_var.get(),
+            "retries": self.retries_var.get(),
+            "format": self.format_var.get(),
+        }
+
+    def _apply_state(self, st: dict) -> bool:
+        if not st:
+            return False
+        self.url_text.delete("1.0", "end")
+        self.url_text.insert("1.0", st.get("urls", ""))
+        self.mode_var.set(st.get("mode", "Default"))
+        self.artist_var.set(st.get("artist", ""))
+        self.songtitle_var.set(st.get("song", ""))
+        self.shorts_var.set(bool(st.get("shorts", False)))
+        self.forcescan_var.set(bool(st.get("forcescan", False)))
+        dest = st.get("dest", "")
+        if dest and os.path.isdir(dest):
+            self.dest_var.set(dest)
+        if st.get("quality") in QUALITIES:
+            self.quality_var.set(st["quality"])
+        if st.get("audio_fmt") in AUDIO_FORMATS:
+            self.fmt_var.set(st["audio_fmt"])
+        for var, key in ((self.delay_var, "delay"), (self.timelimit_var, "timelimit"),
+                         (self.minlen_var, "minlen"), (self.maxlen_var, "maxlen"),
+                         (self.limit_var, "limit"), (self.jobs_var, "jobs"),
+                         (self.subslangs_var, "subslangs"), (self.retries_var, "retries"),
+                         (self.format_var, "format"), (self.cookies_var, "cookies")):
+            var.set(str(st.get(key, "")) if key in st else var.get())
+        for wvar, key in ((self.subs_var, "subs"), (self.nothumb_var, "nothumb"),
+                          (self.nometa_var, "nometa"), (self.noplaylist_var, "noplaylist"),
+                          (self.keepdupes_var, "keepdupes"), (self.noarchive_var, "noarchive"),
+                          (self.redo_var, "redo"), (self.verbose_var, "verbose")):
+            wvar.set(bool(st.get(key, wvar.get())))
+        self.preset_var.set("Custom")
+        self._on_mode_change()
+        return True
+
+    def _save_state_file(self, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(self._capture_state(), fh, ensure_ascii=False, indent=1)
+
+    def save_session(self):
+        name = self.session_name_var.get().strip()
+        if not name:
+            name = self.session_pick_var.get().strip() or "session"
+        safe = name.replace("<", "_").replace(">", "_").replace(":", "_")\
+                   .replace('"', "_").replace("/", "_").replace("\\", "_")\
+                   .replace("|", "_").replace("?", "_").replace("*", "_").strip()
+        path = os.path.join(self._sessions_dir(), (safe or "session") + ".json")
+        try:
+            self._save_state_file(path)
+            self._log(None, "head", f"💾 session saved: {safe}")
+        except Exception as exc:
+            self._log(None, "err", f"session save failed: {exc}")
+            return
+        self.session_cb.configure(values=self._list_sessions())
+        self.session_pick_var.set(safe)
+        self.session_name_var.set(safe)
+
+    def load_session(self):
+        name = self.session_pick_var.get().strip()
+        if not name:
+            self._log(None, "warn", "pick a saved session from the list first")
+            return
+        try:
+            with open(os.path.join(self._sessions_dir(), name + ".json"),
+                      "r", encoding="utf-8") as fh:
+                st = json.load(fh)
+        except Exception as exc:
+            self._log(None, "err", f"session load failed: {exc}")
+            return
+        self._apply_state(st)
+        self.session_name_var.set(name)
+        self._log(None, "head", f"♻ session loaded: {name}")
+
+    def delete_session(self):
+        name = self.session_pick_var.get().strip()
+        if not name:
+            return
+        if not messagebox.askyesno(APP_TITLE, f'Delete saved session "{name}"?'):
+            return
+        try:
+            os.remove(os.path.join(self._sessions_dir(), name + ".json"))
+            self.session_pick_var.set("")
+            self.session_cb.configure(values=self._list_sessions())
+            self._log(None, "info", f"🗑 session deleted: {name}")
+        except Exception as exc:
+            self._log(None, "err", f"session delete failed: {exc}")
+
+    def _autosave(self):
+        try:
+            self._save_state_file(self._last_session_path())
+        except Exception:
+            pass
+
+    def _restore_last_session(self):
+        try:
+            with open(self._last_session_path(), "r", encoding="utf-8") as fh:
+                st = json.load(fh)
+        except Exception:
+            return
+        if self._apply_state(st):
+            self._log(None, "head", "♻ last session restored "
+                       "(auto-saved when the app was closed)")
+            self._log(None, "info",
+                      "· links, cookies, settings & download location back")
 
     # ----------------------------------------------------------- actions ---
     def load_file(self):
@@ -1033,6 +1221,7 @@ class App(tk.Tk):
         self.log_text.configure(state="disabled")
 
     def on_close(self):
+        self._autosave()
         if self.worker and self.worker.is_alive():
             if not messagebox.askyesno(
                     APP_TITLE, "A download is running. Stop it and exit?"):
