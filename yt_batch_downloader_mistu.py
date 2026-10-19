@@ -25,7 +25,7 @@ from concurrent.futures import TimeoutError as FutTimeout  # noqa: F401 (reserve
 from urllib.parse import urlparse
 import urllib.request
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -493,27 +493,43 @@ _RETRYABLE_RE = re.compile(
 
 # Fallback ladder of player clients that bypass bot-gated webpage state
 # (no PO-token path used by community fallbacks; run as sequential passes).
-# The final entry drops cookies: exported web-session cookie state is what
-# poisons the watch page ("The page needs to be reloaded"), and public
-# videos never need cookies.
+# Cookieless entries come FIRST: exported web-session cookies are the most
+# common cause of "The page needs to be reloaded" on watch pages, and public
+# videos never need them. A cookied try stays last (age-gated videos).
 _PLAYER_FALLBACKS = [
-    ({"youtube": {"player_client": ["android", "web_safari"]}}, False),
-    ({"youtube": {"player_client": ["tv_simply"]}}, False),
     ({"youtube": {"player_client": ["android", "web_safari"]}}, True),
+    ({"youtube": {"player_client": ["tv_simply"]}}, True),
+    ({"youtube": {"player_client": ["android", "web_safari"]}}, False),
 ]
+
+_PLAYER_NAMES = {
+    1: "android + web_safari (no cookies)",
+    2: "tv_simply (no cookies)",
+    3: "android + web_safari (logged in)",
+}
 
 
 def _all_passes() -> list:
-    """Every attempt in full ladder order — index 0 = 'as configured'."""
+    """Every attempt in ladder order — index 0 = 'as configured'."""
     return [(None, False)] + list(_PLAYER_FALLBACKS)
 
 
-_PLAYER_NAMES = {
-    0: "yt-dlp default",
-    1: "android + web_safari",
-    2: "tv_simply",
-    3: "android + web_safari (no cookies)",
-}
+def _pass_signature(pos: int) -> str:
+    """Stable string id for a pass (survives ladder reorderings)."""
+    clients, drop = _all_passes()[pos]
+    if clients is None:
+        return "default"
+    return ("+".join(clients["youtube"]["player_client"])
+            + ("|nocookie" if drop else ""))
+
+
+def _signature_index(sig: str):
+    if not sig:
+        return None
+    for i in range(len(_all_passes())):
+        if _pass_signature(i) == sig:
+            return i
+    return None
 
 # Adaptive memory: on a poisoned session the FIRST item can burn the whole
 # ladder before something works; remember the winning pass so the remaining
@@ -525,29 +541,29 @@ _ADAPTIVE_MEMO: dict = {}
 
 
 def _adaptive_load(cookiefile: str):
-    """Remembered winning pass idx for this cookie file (None = no memory)."""
+    """Remembered winning pass signature for this cookie file (str|None)."""
     key = cookiefile or ""
     if key not in _ADAPTIVE_MEMO:
-        val = None
+        sig = None
         try:
             with open(_ADAPTIVE_PATH, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             if data.get("cookiefile", "") == key:
-                val = int(data.get("win", -1))
-                if not (0 <= val < len(_all_passes())):
-                    val = None
+                s = str(data.get("win", ""))
+                if _signature_index(s) is not None:
+                    sig = s
         except Exception:
-            val = None
-        _ADAPTIVE_MEMO[key] = val
+            sig = None
+        _ADAPTIVE_MEMO[key] = sig
     return _ADAPTIVE_MEMO[key]
 
 
-def _adaptive_save(cookiefile: str, win: int | None) -> None:
-    _ADAPTIVE_MEMO[cookiefile or ""] = win
+def _adaptive_save(cookiefile: str, sig: str | None) -> None:
+    _ADAPTIVE_MEMO[cookiefile or ""] = sig
     try:
         os.makedirs(os.path.dirname(_ADAPTIVE_PATH), exist_ok=True)
         with open(_ADAPTIVE_PATH, "w", encoding="utf-8") as fh:
-            json.dump({"cookiefile": cookiefile or "", "win": win}, fh)
+            json.dump({"cookiefile": cookiefile or "", "win": sig}, fh)
     except Exception:
         pass
 
@@ -556,12 +572,14 @@ def _with_player_fallbacks(base_opts: dict, prefix: str, run):
     """Run `run(ydl)` across player-client passes when YouTube hard-blocks.
 
     Order: the previously-learned winning pass (if any), then the configured
-    pass, then the client ladder — final pass runs cookieless. Fresh cache
-    between passes. Throws the last error when every pass fails;
+    pass, then the client ladder (cookieless entries first). Fresh cache
+    between passes. Raises the last error when every pass fails;
     RunCancelled / KeyboardInterrupt pass through untouched."""
     passes = _all_passes()
     ckey = str(base_opts.get("cookiefile") or "")
-    win = _adaptive_load(ckey)
+    win = _signature_index(_adaptive_load(ckey))
+    if win == 0:
+        win = None
     order = ([win] if win is not None else []) + \
             [i for i in range(len(passes)) if i != win]
     for pos in order:
@@ -576,10 +594,10 @@ def _with_player_fallbacks(base_opts: dict, prefix: str, run):
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 result = run(ydl)
-            if pos != 0 and _ADAPTIVE_MEMO.get(ckey) != pos:
-                _adaptive_save(ckey, pos)
-                log(f"{prefix} · learned: {_PLAYER_NAMES.get(pos, pos)} "
-                    "works in this session — trying it first from now on")
+            if pos != 0 and _ADAPTIVE_MEMO.get(ckey) != _pass_signature(pos):
+                _adaptive_save(ckey, _pass_signature(pos))
+                log(f"{prefix} · learned: {_PLAYER_NAMES.get(pos, _pass_signature(pos))}"
+                    " works in this session — trying it first from now on")
             return result
         except KeyboardInterrupt:
             raise
@@ -1296,6 +1314,53 @@ BANNER = r"""
 ====================================================
 """
 
+_LOGIN_COOKIE_NAMES = {
+    "SID", "HSID", "SSID", "APISID", "SAPISID",
+    "__Secure-1PAPISID", "__Secure-3PAPISID",
+    "__Secure-1PSID", "__Secure-3PSID", "LOGIN_INFO",
+}
+
+
+def _describe_cookies(path: str) -> tuple:
+    """Inspect a Netscape cookies.txt. Returns (summary, problem|None).
+    Counts are logged, never cookie values."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+    except Exception as exc:
+        return None, f"file unreadable ({exc})"
+    total = yt_n = login_n = 0
+    names = set()
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split("\t")
+        if len(parts) < 7:
+            continue
+        total += 1
+        dom = parts[0].lower()
+        if "youtube" in dom or dom.endswith("google.com"):
+            yt_n += 1
+        name = parts[5]
+        names.add(name)
+        if name in _LOGIN_COOKIE_NAMES:
+            login_n += 1
+    if not total:
+        return None, ("no cookies found — export the file from your browser "
+                      "as Netscape format while logged in on youtube.com")
+    summary = (f"{total} cookies (YouTube/Google: {yt_n}, "
+               f"login session: {'yes' if login_n else 'NOT FOUND'})")
+    if not yt_n:
+        prob = ("no YouTube/Google cookies in this file — it was probably "
+                "exported from another site; export it while ON youtube.com")
+        return summary, prob
+    if not login_n:
+        prob = ("cookies present but no login session — export again while "
+                "LOGGED IN on youtube.com (or just run without cookies)")
+        return summary, prob
+    return summary, None
+
 
 def execute(args) -> int:
     """Run the full pipeline for parsed args. Usable from the CLI and the GUI.
@@ -1354,6 +1419,14 @@ def execute(args) -> int:
 
     dest = os.path.abspath(args.dest)
     os.makedirs(dest, exist_ok=True)
+
+    # cookie transparency: show the user exactly what will be used
+    if getattr(args, "cookies", None):
+        cinfo, cprob = _describe_cookies(args.cookies)
+        if cinfo:
+            log(f"· cookies: {args.cookies}  ({cinfo})")
+        if cprob:
+            log(f"· cookies: {args.cookies}  ⚠ {cprob}")
 
     if getattr(args, "regular", False):
         scan_urls = []
