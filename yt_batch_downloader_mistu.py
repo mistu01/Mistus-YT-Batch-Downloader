@@ -25,7 +25,7 @@ from concurrent.futures import TimeoutError as FutTimeout  # noqa: F401 (reserve
 from urllib.parse import urlparse
 import urllib.request
 
-__version__ = "2.3.1"
+__version__ = "2.4.0"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -486,6 +486,7 @@ _RETRYABLE_RE = re.compile(
     r"page needs to be reloaded"
     r"|not a bot"
     r"|429|too many requests"
+    r"|403|forbidden"
     r"|sign in to confirm"
     r"|try again later"
     r"|requested format is not available",
@@ -744,13 +745,19 @@ def scan_channel(url: str, args) -> tuple[str, list]:
 
 
 def _length_ok(duration, v_min, v_max) -> bool:
-    if v_min is None and v_max is None:
+    """Bounds: 0 / None both mean 'no bound'. UNKNOWN durations are kept —
+    a channel listing that misses durations must never wipe a batch."""
+    has_min = bool(v_min)
+    has_max = bool(v_max)
+    if not has_min and not has_max:
         return True
     if duration is None:
+        log("  note: duration unknown on a filtered channel — item kept, "
+            "filter ignored for it")
+        return True
+    if has_min and duration < v_min:
         return False
-    if v_min is not None and duration < v_min:
-        return False
-    if v_max is not None and duration > v_max:
+    if has_max and duration > v_max:
         return False
     return True
 
@@ -830,6 +837,60 @@ def vtt_to_text(path: str) -> str:
             if line and (not out or line != out[-1]):
                 out.append(line)
     return "\n".join(out)
+
+
+def _match_caption_tracks(info, langs: list):
+    """(lang, formats) of the first requested language available, or None."""
+    for key in ("automatic_captions", "subtitles"):
+        data = info.get(key) or {}
+        if not data:
+            continue
+        for lang in langs:
+            if lang in data:
+                return lang, data[lang]
+            if lang.endswith(".*"):
+                base = lang[:-2]
+                for k in data:
+                    if k == base or k.startswith(base + "-"):
+                        if data.get(k):
+                            return k, data[k]
+    return None
+
+
+def _fetch_transcript_from_info(info, langs: list, workdir: str, args) -> tuple:
+    """Fetch a caption VTT straight from the track URL the metadata
+    extraction ALREADY returned. The old path hit the watch page a second
+    time per video, which is what kept tripping YouTube's subtitle
+    endpoint (HTTP 429) and burned ladder retries on every item."""
+    found = _match_caption_tracks(info, langs)
+    if not found:
+        return "", ""
+    track_lang, fmts = found
+    pick = None
+    for f in fmts or []:
+        if f.get("ext") == "vtt":
+            pick = f
+            break
+    if pick is None and fmts:
+        pick = fmts[0]
+    url = (pick or {}).get("url")
+    if not url:
+        return "", ""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/126.0.0.0 Safari/537.36"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+    except Exception as exc:
+        if args.verbose:
+            log(f"  note: transcript skipped ({str(exc)[:80]})")
+        return "", ""
+    path = os.path.join(workdir, f"cap.{track_lang}.vtt")
+    with open(path, "wb") as fh:
+        fh.write(raw)
+    return track_lang, vtt_to_text(path)
 
 
 def _fetch_transcript(url: str, langs: list, workdir: str, args) -> tuple[str, str]:
@@ -981,8 +1042,13 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
     info_done = os.path.isfile(os.path.join(info_dir, stem + ".txt"))
     thumb_done = _thumb_exists(thumb_dir, stem)
 
-    # ---- metadata ----
+    # ---- instant resume: fully saved items cost zero network calls ------
     log(f"{prefix} ▸ {vid['title']} ({_fmt_dur(vid.get('duration'))})")
+    if audio_done and info_done and thumb_done:
+        log(f"{prefix} ✓ skipped (already saved)")
+        return True, None
+
+    # ---- metadata ----
     meta_opts = {
         "quiet": not args.verbose,
         "verbose": args.verbose,
@@ -1000,17 +1066,13 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
     if not info:
         return False, "metadata extraction failed"
 
-    if audio_done and info_done and thumb_done:
-        log(f"{prefix} ✓ skipped (already saved)")
-        return True, None
-
     # ---- transcript (only if the info txt is missing) ----
     if info_done:
         t_lang, transcript = "", ""
     else:
         with tempfile.TemporaryDirectory(prefix="mistu-cap-") as capdir:
-            t_lang, transcript = _fetch_transcript(
-                vid["url"], ["en-orig", "en.*"], capdir, args)
+            t_lang, transcript = _fetch_transcript_from_info(
+                info, ["en-orig", "en.*"], capdir, args)
 
     # ---- audio (mp3/m4a/... via bundled ffmpeg) ----
     if not audio_done:
@@ -1487,7 +1549,11 @@ def execute(args) -> int:
                 if _CANCEL_LATCH.is_set():
                     raise RunCancelled()
 
-        for s_url in scan_urls:
+        for ci, s_url in enumerate(scan_urls):
+            if ci and args.scan_delay and args.scan_delay > 0:
+                # breathe between channels too (latch wait = instant stop)
+                if _CANCEL_LATCH.wait(args.scan_delay):
+                    _check_cancel()
             _check_cancel()
             s_ok, s_fails = run_scan(s_url, args, ffmpeg_dir)
             ok_count += s_ok
