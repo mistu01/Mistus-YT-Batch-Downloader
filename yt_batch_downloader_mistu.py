@@ -26,7 +26,7 @@ from concurrent.futures import TimeoutError as FutTimeout  # noqa: F401 (reserve
 from urllib.parse import urlparse
 import urllib.request
 
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:

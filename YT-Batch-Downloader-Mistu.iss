@@ -1,12 +1,12 @@
 ; YT-Batch-Downloader-Mistu — Inno Setup script
-; Compile:  ISCC.exe /DAppVersion=2.6.0 YT-Batch-Downloader-Mistu.iss
+; Compile:  ISCC.exe /DAppVersion=2.7.0 YT-Batch-Downloader-Mistu.iss
 ; Requires the staging folder build/installer/YT-Batch-Downloader-Mistu
 ; (created by build_installer.py).
 
 #define AppName "Mistus Batch YT Downloader"
 
 #ifndef AppVersion
-  #define AppVersion "2.6.0"
+  #define AppVersion "2.7.0"
 #endif
 
 [Setup]
@@ -18,7 +18,10 @@ AppPublisher=Mistu
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
-UninstallDisplayIcon={app}\app\python\pythonw.exe
+UninstallDisplayIcon={app}\assets\icon.ico
+SetupIconFile=assets\icon.ico
+WizardImageFile=assets\wizard_192.bmp,assets\wizard_164.bmp
+WizardSmallImageFile=assets\wizsmall_55.bmp,assets\wizsmall_32.bmp
 OutputDir=dist
 OutputBaseFilename={#AppName}-{#AppVersion}-setup
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -40,12 +43,15 @@ Source: "build\installer\YT-Batch-Downloader-Mistu\*"; DestDir: "{app}"; \
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\app\python\pythonw.exe"; \
+    IconFilename: "{app}\assets\icon.ico"; \
     Parameters: """{app}\mistu_gui.py"""; WorkingDir: "{app}"; \
     Comment: "YouTube batch downloader & channel scanner"
 Name: "{group}\{#AppName} (CLI)"; Filename: "{app}\YT-Batch-Downloader-Mistu-CLI.cmd"; \
+    IconFilename: "{app}\assets\icon.ico"; \
     WorkingDir: "{app}"; Comment: "Command-line version"
 Name: "{group}\{#AppName} (Uninstall)"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\app\python\pythonw.exe"; \
+    IconFilename: "{app}\assets\icon.ico"; \
     Parameters: """{app}\mistu_gui.py"""; WorkingDir: "{app}"; \
     Tasks: desktopicon
 
@@ -116,4 +122,31 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
     RemovePathEntry(WizardDirValue);
+end;
+
+// ---- neo-brutalist wizard: cream surfaces, black text ----------------------
+const
+  NbCream = $00E4EDF2;   // #f2ede4 as TColor (BGR)
+
+procedure ApplyNeoBrutalism;
+var
+  I: integer;
+  C: TComponent;
+begin
+  for I := 0 to WizardForm.ComponentCount - 1 do
+  begin
+    C := WizardForm.Components[I];
+    if C is TPanel then
+      TPanel(C).Color := NbCream;
+    if C is TLabel then
+      TLabel(C).Font.Color := clBlack;
+    if C is TNewStaticText then
+      TNewStaticText(C).Font.Color := clBlack;
+  end;
+  WizardForm.Color := NbCream;
+end;
+
+procedure InitializeWizard;
+begin
+  ApplyNeoBrutalism;
 end;

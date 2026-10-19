@@ -42,7 +42,7 @@ import zipfile
 APP_NAME = "YT-Batch-Downloader-Mistu"
 ENGINE = "yt_batch_downloader_mistu.py"
 GUI = "mistu_gui.py"
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 BUILD_DIR = os.path.join(ROOT, "build")
@@ -213,6 +213,12 @@ def stage_app_files() -> None:
     step("4. Program files")
     for name in (ENGINE, GUI, "README.md"):
         shutil.copy2(os.path.join(ROOT, name), os.path.join(STAGE, name))
+    # visual identity: app icon + Inno wizard art (window icon, shortcuts)
+    assets_src = os.path.join(ROOT, "assets")
+    if not os.path.isfile(os.path.join(assets_src, "icon.ico")):
+        raise SystemExit("error: assets/icon.ico missing — see assets/ in the repo")
+    shutil.copytree(assets_src, os.path.join(STAGE, "assets"),
+                    ignore=shutil.ignore_patterns("preview*.png"))
     cli_cmd = os.path.join(STAGE, "YT-Batch-Downloader-Mistu-CLI.cmd")
     with open(cli_cmd, "w", encoding="ascii", newline="\r\n") as fh:
         fh.write(

@@ -256,12 +256,25 @@ def default_dest() -> str:
 
 
 class App(tk.Tk):
+    def _apply_icon(self):
+        """Neo-brutalist window/taskbar icon (bundled next to the script)."""
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+            for cand in (os.path.join(base, "assets", "icon.ico"),
+                         os.path.join(base, "icon.ico")):
+                if os.path.isfile(cand):
+                    self.iconbitmap(cand)
+                    return
+        except Exception:
+            pass
+
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
         self.geometry("1080x880")
         self.minsize(960, 760)
         self.configure(bg=BG)
+        self._apply_icon()
 
         self.msg_q: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
