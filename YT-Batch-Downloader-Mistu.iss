@@ -1,12 +1,12 @@
 ; YT-Batch-Downloader-Mistu — Inno Setup script
-; Compile:  ISCC.exe /DAppVersion=2.7.0 YT-Batch-Downloader-Mistu.iss
+; Compile:  ISCC.exe /DAppVersion=2.8.0 YT-Batch-Downloader-Mistu.iss
 ; Requires the staging folder build/installer/YT-Batch-Downloader-Mistu
 ; (created by build_installer.py).
 
 #define AppName "Mistus Batch YT Downloader"
 
 #ifndef AppVersion
-  #define AppVersion "2.7.0"
+  #define AppVersion "2.8.0"
 #endif
 
 [Setup]

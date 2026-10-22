@@ -24,9 +24,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FutTimeout  # noqa: F401 (reserved)
 from urllib.parse import urlparse
+import socket
 import urllib.request
 
-__version__ = "2.7.0"
+__version__ = "2.8.0"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -80,6 +81,195 @@ class RunCancelled(Exception):
     """Raised inside the pipeline when the user pressed Stop."""
 
 
+class DownloadStalled(Exception):
+    """Raised inside the pipeline when an item download stalls with no data."""
+
+
+_THREAD_LOCAL = threading.local()
+_GLOBAL_SOCKETS: set[socket.socket] = set()
+_GLOBAL_SOCK_LOCK = threading.Lock()
+
+
+def _abort_sockets(sock_set: set[socket.socket], lock: threading.Lock) -> None:
+    with lock:
+        socks = list(sock_set)
+    for s in socks:
+        try:
+            s.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _abort_all_sockets() -> None:
+    _abort_sockets(_GLOBAL_SOCKETS, _GLOBAL_SOCK_LOCK)
+
+
+_ORIG_SOCKET = socket.socket
+
+
+class _TrackedSocket(_ORIG_SOCKET):
+    """Socket subclass that tracks open sockets per-thread (for stall watchdog)
+    and globally (so Stop immediately breaks any blocked network reads)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        wd = getattr(_THREAD_LOCAL, "watchdog", None)
+        if wd:
+            wd.register(self)
+        with _GLOBAL_SOCK_LOCK:
+            _GLOBAL_SOCKETS.add(self)
+
+    def connect(self, address):
+        if _CANCEL_LATCH.is_set():
+            raise OSError("Connection aborted: stop requested")
+        wd = getattr(_THREAD_LOCAL, "watchdog", None)
+        if wd and wd.stalled:
+            raise OSError("Connection aborted: download stalled")
+        return super().connect(address)
+
+    def close(self):
+        wd = getattr(_THREAD_LOCAL, "watchdog", None)
+        if wd:
+            wd.unregister(self)
+        with _GLOBAL_SOCK_LOCK:
+            _GLOBAL_SOCKETS.discard(self)
+        super().close()
+
+
+# Install socket wrapper
+socket.socket = _TrackedSocket
+
+
+class DownloadWatchdog:
+    """Monitors active download progress and aborts sockets if no data arrives
+    for `timeout_sec` (e.g. 5 minutes). Also responds immediately to Stop."""
+
+    def __init__(self, timeout_sec: float = 300.0, prefix: str = ""):
+        self.timeout_sec = float(timeout_sec or 0)
+        self.prefix = prefix
+        self.start_time = time.time()
+        self.last_progress_time = time.time()
+        self.last_bytes = 0
+        self.stalled = False
+        self.cancelled = False
+        self.stop_event = threading.Event()
+        self.sockets: set[socket.socket] = set()
+        self.lock = threading.Lock()
+        self._monitor_thread = None
+
+    def register(self, sock: socket.socket) -> None:
+        with self.lock:
+            self.sockets.add(sock)
+
+    def unregister(self, sock: socket.socket) -> None:
+        with self.lock:
+            self.sockets.discard(sock)
+
+    def record_progress(self, downloaded_bytes: int | None = None) -> None:
+        now = time.time()
+        if downloaded_bytes is not None:
+            if downloaded_bytes > self.last_bytes:
+                self.last_bytes = downloaded_bytes
+                self.last_progress_time = now
+        else:
+            self.last_progress_time = now
+
+    def abort(self) -> None:
+        _abort_sockets(self.sockets, self.lock)
+
+    def __enter__(self):
+        _THREAD_LOCAL.watchdog = self
+        if self.timeout_sec > 0:
+            self.start_time = time.time()
+            self.last_progress_time = time.time()
+            self.stop_event.clear()
+            self.stalled = False
+            self.cancelled = False
+
+            def _monitor():
+                while not self.stop_event.wait(1.0):
+                    if _CANCEL_LATCH.is_set():
+                        self.cancelled = True
+                        self.abort()
+                        break
+                    now = time.time()
+                    if now - self.last_progress_time >= self.timeout_sec:
+                        self.stalled = True
+                        self.abort()
+                        break
+
+            self._monitor_thread = threading.Thread(target=_monitor, daemon=True)
+            self._monitor_thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop_event.set()
+        _THREAD_LOCAL.watchdog = None
+        self.abort()
+
+
+def attach_watchdog_to_ydl(ydl) -> None:
+    """Intercept ydl.urlopen to enforce stall/cancel checks and record read progress."""
+    orig_urlopen = ydl.urlopen
+
+    def watched_urlopen(req):
+        if _CANCEL_LATCH.is_set():
+            raise RunCancelled()
+        wd = getattr(_THREAD_LOCAL, "watchdog", None)
+        if wd:
+            if wd.stalled:
+                raise DownloadStalled(f"Stalled: no data received for {int(wd.timeout_sec)}s")
+            if wd.cancelled:
+                raise RunCancelled()
+        res = orig_urlopen(req)
+        orig_read = getattr(res, "read", None)
+        if orig_read:
+            def watched_read(*args, **kwargs):
+                if _CANCEL_LATCH.is_set():
+                    raise RunCancelled()
+                w = getattr(_THREAD_LOCAL, "watchdog", None)
+                if w:
+                    if w.stalled:
+                        raise DownloadStalled(f"Stalled: no data received for {int(w.timeout_sec)}s")
+                    if w.cancelled:
+                        raise RunCancelled()
+                data = orig_read(*args, **kwargs)
+                if data and w:
+                    w.record_progress()
+                return data
+            res.read = watched_read
+        return res
+
+    ydl.urlopen = watched_urlopen
+
+
+def _clean_partial_files(folder: str, stem_or_id: str) -> None:
+    """Remove incomplete, .part, .ytdl, or empty files left by an interrupted download."""
+    if not folder or not os.path.isdir(folder):
+        return
+    try:
+        safe_key = str(stem_or_id).strip()
+        if not safe_key:
+            return
+        for fname in os.listdir(folder):
+            if safe_key in fname:
+                lower = fname.lower()
+                full = os.path.join(folder, fname)
+                if not os.path.isfile(full):
+                    continue
+                if ".part" in lower or lower.endswith(".ytdl") or lower.endswith(".temp") or os.path.getsize(full) == 0:
+                    try:
+                        os.remove(full)
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+
+
 def set_logger(fn) -> None:
     """GUIs install a log sink: log lines go to fn(msg) instead of stdout."""
     global _LOG
@@ -87,8 +277,9 @@ def set_logger(fn) -> None:
 
 
 def request_cancel() -> None:
-    """Ask the running pipeline to stop after the current download."""
+    """Ask the running pipeline to stop immediately."""
     _CANCEL_LATCH.set()
+    _abort_all_sockets()
 
 
 def reset_cancel() -> None:
@@ -257,6 +448,8 @@ def parse_args(argv=None):
                         help="parallel downloads (default: 1; >1 disables the live progress bar)")
     engine.add_argument("--retries", type=int, default=10, metavar="N",
                         help="network retries per item (default: 10)")
+    engine.add_argument("--stall-timeout", type=float, default=300.0, metavar="SEC",
+                        help="skip item if no data is downloaded within SEC seconds (default: 300, 0 = disabled)")
     engine.add_argument("--format", default=None, metavar="SELECTOR",
                         help="raw yt-dlp format selector — overrides -q/--quality")
     engine.add_argument("--cookies", default=None, metavar="FILE",
@@ -393,6 +586,7 @@ def build_ydl_opts(args, ffmpeg_dir, archive, hook):
         "retries": args.retries,
         "fragment_retries": args.retries,
         "extractor_retries": 3,
+        "source_address": "0.0.0.0",      # force IPv4 to avoid IPv6 routing stalls
         "socket_timeout": 30,
         "ignoreerrors": False,
         "concurrent_fragment_downloads": 4,
@@ -433,6 +627,18 @@ def make_hook(prefix: str, parallel: bool):
         if _CANCEL_LATCH.is_set():
             # Stop works mid-download: hooks run tight in the transfer loop
             raise RunCancelled()
+        wd = getattr(_THREAD_LOCAL, "watchdog", None)
+        if wd:
+            if wd.stalled:
+                raise DownloadStalled(f"Stalled: no data received for {int(wd.timeout_sec)}s")
+            if wd.cancelled:
+                raise RunCancelled()
+            status = d.get("status")
+            if status == "downloading":
+                got = d.get("downloaded_bytes") or 0
+                wd.record_progress(got)
+            elif status == "finished":
+                wd.record_progress()
         status = d.get("status")
 
         if status == "downloading" and _LOG is not None:
@@ -617,9 +823,14 @@ def _with_player_fallbacks(base_opts: dict, prefix: str, run):
                 log(f"{prefix} · learned: {_PLAYER_NAMES.get(pos, _pass_signature(pos))}"
                     " works in this session — trying it first from now on")
             return result
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, RunCancelled, DownloadStalled):
             raise
         except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
+            wd = getattr(_THREAD_LOCAL, "watchdog", None)
+            if wd and wd.stalled:
+                raise DownloadStalled(f"Stalled: no data received for {int(wd.timeout_sec)}s") from exc
+            if _CANCEL_LATCH.is_set():
+                raise RunCancelled() from exc
             msg = str(exc).replace("\n", " ")
             if msg.startswith("ERROR: "):
                 msg = msg[len("ERROR: "):]
@@ -781,16 +992,27 @@ def download_one(index: int, total: int, url: str, args, ffmpeg_dir, archive) ->
                 pass
         ydl.download([url])
 
+    stall_sec = getattr(args, "stall_timeout", 300.0)
     try:
-        _with_player_fallbacks(opts, prefix, _run)
-        log(f"{prefix} ✓ done")
-        return True, None
+        with DownloadWatchdog(timeout_sec=stall_sec, prefix=prefix) as wd:
+            def _wrapped_run(ydl):
+                attach_watchdog_to_ydl(ydl)
+                _run(ydl)
+            _with_player_fallbacks(opts, prefix, _wrapped_run)
+            log(f"{prefix} ✓ done")
+            return True, None
     except KeyboardInterrupt:
         log(f"{prefix} ! interrupted")
         raise
     except RunCancelled:
         log(f"{prefix} ■ stopped by user")
         raise
+    except DownloadStalled:
+        mins = int(stall_sec / 60) if stall_sec >= 60 else stall_sec
+        unit = "min" if stall_sec >= 60 else "sec"
+        log(f"{prefix} ⚠ download stalled (no data received for {mins} {unit}) — skipping to next item")
+        _clean_partial_files(args.dest, url)
+        return False, f"download stalled (no data for {mins} {unit})"
     except yt_dlp.utils.DownloadError as exc:
         msg = str(exc).replace("\n", " ")
         if msg.startswith("ERROR: "):
@@ -843,6 +1065,7 @@ def scan_channel(url: str, args) -> tuple[str, list]:
         "verbose": args.verbose,
         "no_warnings": not args.verbose,
         "extract_flat": True,
+        "source_address": "0.0.0.0",      # force IPv4 to avoid IPv6 routing stalls
         "socket_timeout": 30,
         "extractor_retries": 3,
         "ignoreerrors": True,          # skip dead members instead of dying
@@ -1133,6 +1356,7 @@ def _fetch_transcript(url: str, langs: list, workdir: str, args) -> tuple[str, s
         "verbose": args.verbose,
         "no_warnings": not args.verbose,
         "noprogress": True,
+        "source_address": "0.0.0.0",      # force IPv4 to avoid IPv6 routing stalls
         "socket_timeout": 30,
         "extractor_retries": 3,
     }
@@ -1285,6 +1509,7 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
         "quiet": not args.verbose,
         "verbose": args.verbose,
         "no_warnings": not args.verbose,
+        "source_address": "0.0.0.0",      # force IPv4 to avoid IPv6 routing stalls
         "socket_timeout": 30,
         "extractor_retries": 3,
     }
@@ -1292,9 +1517,20 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
         meta_opts.update(cookieopts(args))
     # cookie state can poison the watch page ("page needs to be reloaded")
     # — reach for the same player-client ladder the downloads use
-    info = _with_player_fallbacks(
-        meta_opts, prefix,
-        lambda ydl: ydl.extract_info(vid["url"], download=False))
+    stall_sec = getattr(args, "stall_timeout", 300.0)
+    try:
+        with DownloadWatchdog(timeout_sec=stall_sec, prefix=prefix) as wd:
+            def _extract(ydl):
+                attach_watchdog_to_ydl(ydl)
+                return ydl.extract_info(vid["url"], download=False)
+            info = _with_player_fallbacks(meta_opts, prefix, _extract)
+    except DownloadStalled:
+        mins = int(stall_sec / 60) if stall_sec >= 60 else stall_sec
+        unit = "min" if stall_sec >= 60 else "sec"
+        log(f"{prefix} ⚠ metadata extraction stalled (no response for {mins} {unit}) — skipping to next item")
+        return False, f"metadata stalled (no response for {mins} {unit})"
+    except RunCancelled:
+        raise
     if not info:
         return False, "metadata extraction failed"
 
@@ -1328,7 +1564,8 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
             "noprogress": True,
             "progress_hooks": [make_hook(prefix, parallel=False)],
             "retries": args.retries,
-            "socket_timeout": 30,
+            "source_address": "0.0.0.0",      # force IPv4 to avoid IPv6 routing stalls
+        "socket_timeout": 30,
             "extractor_retries": 3,
             "postprocessors": post,
         }
@@ -1336,6 +1573,7 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
             opts["ffmpeg_location"] = ffmpeg_dir
 
         def _run_audio(ydl):
+            attach_watchdog_to_ydl(ydl)
             artist = getattr(args, "artist", None)
             song_title = getattr(args, "song_title", None)
             try:
@@ -1347,9 +1585,19 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
                 pass
             ydl.download([vid["url"]])
 
-        _with_player_fallbacks(opts, prefix, _run_audio)
-        _bitrate = " @ 320 kbps" if audio_format == "mp3" else ""
-        log(f"{prefix} ✓ audio saved: Audio/{stem}.{audio_format}{_bitrate}")
+        try:
+            with DownloadWatchdog(timeout_sec=stall_sec, prefix=prefix) as wd:
+                _with_player_fallbacks(opts, prefix, _run_audio)
+                _bitrate = " @ 320 kbps" if audio_format == "mp3" else ""
+                log(f"{prefix} ✓ audio saved: Audio/{stem}.{audio_format}{_bitrate}")
+        except DownloadStalled:
+            mins = int(stall_sec / 60) if stall_sec >= 60 else stall_sec
+            unit = "min" if stall_sec >= 60 else "sec"
+            log(f"{prefix} ⚠ download stalled (no data received for {mins} {unit}) — skipping to next item")
+            _clean_partial_files(audio_dir, stem)
+            return False, f"download stalled (no data for {mins} {unit})"
+        except RunCancelled:
+            raise
 
     # ---- thumbnail (separate folder, converted to PNG when ffmpeg exists) ----
     if not thumb_done:
@@ -1501,6 +1749,7 @@ def _scan_flat(url: str, args) -> tuple[str, list]:
         "verbose": args.verbose,
         "no_warnings": not args.verbose,
         "extract_flat": True,
+        "source_address": "0.0.0.0",      # force IPv4 to avoid IPv6 routing stalls
         "socket_timeout": 30,
         "extractor_retries": 3,
         "ignoreerrors": True,

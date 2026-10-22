@@ -566,6 +566,10 @@ class App(tk.Tk):
                     note="0 = all").pack(side="left", padx=(0, 16))
         self.jobs_var = tk.StringVar(value="1")
         self._field(r2, "Jobs", self.jobs_var, 5, note="1-8")\
+            .pack(side="left", padx=(0, 16))
+        self.stalltimeout_var = tk.StringVar(value="5")
+        self._field(r2, "Stall timeout (min)", self.stalltimeout_var, 6,
+                    note="skip if stuck (0=off)")\
             .pack(side="left")
 
         r3 = tk.Frame(oc.frame, bg=CARD)
@@ -741,6 +745,7 @@ class App(tk.Tk):
             "maxlen": self.maxlen_var.get(),
             "limit": self.limit_var.get(),
             "jobs": self.jobs_var.get(),
+            "stalltimeout": self.stalltimeout_var.get(),
             "cookies": self.cookies_var.get(),
             "subs": self.subs_var.get(),
             "subslangs": self.subslangs_var.get(),
@@ -775,6 +780,7 @@ class App(tk.Tk):
         for var, key in ((self.delay_var, "delay"), (self.timelimit_var, "timelimit"),
                          (self.minlen_var, "minlen"), (self.maxlen_var, "maxlen"),
                          (self.limit_var, "limit"), (self.jobs_var, "jobs"),
+                         (self.stalltimeout_var, "stalltimeout"),
                          (self.subslangs_var, "subslangs"), (self.retries_var, "retries"),
                          (self.format_var, "format"), (self.cookies_var, "cookies")):
             var.set(str(st.get(key, "")) if key in st else var.get())
@@ -1060,6 +1066,11 @@ class App(tk.Tk):
             ns.jobs = max(1, min(8, int(self.jobs_var.get() or 1)))
         except ValueError:
             ns.jobs = 1
+        try:
+            ns.stall_timeout = max(0.0, float(self.stalltimeout_var.get().strip() or 5) * 60)
+        except ValueError:
+            messagebox.showerror(APP_TITLE, "Stall timeout must be a number of minutes.")
+            return
         ns.cookies = self.cookies_var.get().strip() or None
         ns.subs = self.subs_var.get()
         ns.subs_langs = self.subslangs_var.get().strip() or "en.*"
@@ -1118,7 +1129,7 @@ class App(tk.Tk):
 
     def stop(self):
         engine.request_cancel()
-        self.status_var.set("stopping after current item…")
+        self.status_var.set("stopping…")
 
     def update_ytdlp(self):
         if self.worker and self.worker.is_alive():
@@ -1203,7 +1214,7 @@ class App(tk.Tk):
             return "err"
         if "✓" in msg or "✔" in msg:
             return "ok"
-        if msg.startswith("!") or "hint" in msg:
+        if "⚠" in msg or "stalled" in msg.lower() or msg.startswith("!") or "hint" in msg:
             return "warn"
         return "info"
 
