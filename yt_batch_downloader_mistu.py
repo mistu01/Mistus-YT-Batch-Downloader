@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 import socket
 import urllib.request
 
-__version__ = "2.9.0"
+__version__ = "2.9.1"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -560,6 +560,20 @@ def parse_len(text) -> int | None:
     return int(text)
 
 
+def clean_url(raw: str) -> str:
+    """Extract and sanitize a valid web URL from user text, stripping trailing annotations like '[565 videos]' or notes."""
+    if not raw:
+        return ""
+    s = str(raw).strip()
+    m = re.search(r"(https?://[^\s\"'<>]+)", s)
+    if m:
+        u = m.group(1)
+    else:
+        u = s.split()[0] if s.split() else s
+    u = u.rstrip(")]}>.,;:'\"")
+    return u
+
+
 def collect_urls(targets, dedupe: bool) -> list:
     urls, seen, dropped = [], set(), 0
     for target in targets:
@@ -570,8 +584,11 @@ def collect_urls(targets, dedupe: bool) -> list:
             # also accept comma-separated URLs on the command line
             lines = target.split(",")
         for raw in lines:
-            u = raw.strip()
-            if not u or u.startswith("#"):
+            raw_s = raw.strip()
+            if not raw_s or raw_s.startswith("#"):
+                continue
+            u = clean_url(raw_s)
+            if not u:
                 continue
             key = u.lower()
             if dedupe and key in seen:
@@ -1043,7 +1060,10 @@ _ACTIVE_COOKIE_PATH = os.path.join(
 def cookieopts(args) -> dict:
     """Cookie options for the ydl opts dict. Accepts a cookies.txt PATH or
     a live browser NAME (firefox / chrome / chrome:Profile 2 / …)."""
-    c = getattr(args, "cookies", None)
+    raw_c = getattr(args, "cookies", None)
+    if not raw_c:
+        return {}
+    c = str(raw_c).strip().strip("'\"")
     if not c:
         return {}
     std_headers = {
@@ -1056,23 +1076,32 @@ def cookieopts(args) -> dict:
             "cookiesfrombrowser": parsed,
             "http_headers": std_headers,
         }
-    if os.path.isfile(c):
-        count = sanitize_cookie_file(c, _ACTIVE_COOKIE_PATH)
+    norm_path = os.path.normpath(c)
+    if os.path.isfile(norm_path):
+        count = sanitize_cookie_file(norm_path, _ACTIVE_COOKIE_PATH)
         if count > 0:
             return {
                 "cookiefile": _ACTIVE_COOKIE_PATH,
                 "http_headers": std_headers,
             }
+        return {
+            "cookiefile": norm_path,
+            "http_headers": std_headers,
+        }
     return {
-        "cookiefile": c,
+        "cookiefile": norm_path,
         "http_headers": std_headers,
     }
 
 
 def _probe_browser_cookies(args) -> bool:
     """Pre-flight check of cookies (live-browser or exported cookies.txt)."""
-    c = getattr(args, "cookies", None)
+    raw_c = getattr(args, "cookies", None)
+    if not raw_c:
+        return True
+    c = str(raw_c).strip().strip("'\"")
     if not c:
+        args.cookies = None
         return True
     parsed = _parse_browser_cookie(c)
     if parsed:
@@ -1093,11 +1122,21 @@ def _probe_browser_cookies(args) -> bool:
             else:
                 log("· cookies: please use an exported cookies.txt file instead.")
             return False
-    elif os.path.isfile(c):
-        count = sanitize_cookie_file(c, _ACTIVE_COOKIE_PATH)
-        log(f"· cookies: loaded {os.path.basename(c)} ({count} cookies active, sanitized Netscape format)")
+
+    norm_path = os.path.normpath(c)
+    if not os.path.isfile(norm_path):
+        log(f"⚠ cookies: file not found on disk: '{norm_path}'")
+        log("  Please check that the file path is correct and accessible.")
+        return False
+
+    count = sanitize_cookie_file(norm_path, _ACTIVE_COOKIE_PATH)
+    if count > 0:
+        log(f"✓ cookies: active ({count} cookies loaded from '{os.path.basename(norm_path)}', Netscape sanitized)")
         return True
-    return True
+    else:
+        log(f"⚠ cookies: '{os.path.basename(norm_path)}' contains 0 valid cookies")
+        log("  Please export fresh cookies from Chrome/Firefox using a cookies.txt extension.")
+        return False
 
 
 def _session_key(opts: dict) -> str:
@@ -1184,6 +1223,7 @@ def looks_like_channel(url: str) -> bool:
 
 
 def _channel_tab_urls(url: str, include_shorts: bool) -> list:
+    url = clean_url(url)
     path = urlparse(url).path.rstrip("/").lower()
     if path.endswith("/shorts"):
         return [url]
@@ -1201,6 +1241,7 @@ def _channel_tab_urls(url: str, include_shorts: bool) -> list:
 
 def scan_channel(url: str, args) -> tuple[str, list]:
     """Flat-extract a channel's videos (+shorts). Returns (channel_name, videos)."""
+    url = clean_url(url)
     log(f"· scanning channel: {url}")
     videos, seen = [], set()
     chan_name = None
@@ -1211,7 +1252,7 @@ def scan_channel(url: str, args) -> tuple[str, list]:
         "extract_flat": True,
         "source_address": "0.0.0.0",      # force IPv4 to avoid IPv6 routing stalls
         "socket_timeout": 30,
-        "extractor_retries": 3,
+        "extractor_retries": 5,
         "ignoreerrors": True,          # skip dead members instead of dying
         "logger": None,
     }
@@ -1222,8 +1263,12 @@ def scan_channel(url: str, args) -> tuple[str, list]:
     for tab in _channel_tab_urls(url, include_shorts=args.shorts):
         is_short_tab = tab.rstrip("/").lower().endswith("/shorts")
         log(f"· scan tab: {tab}")
-        with yt_dlp.YoutubeDL(scan_opts) as ydl:
-            info = ydl.extract_info(tab, download=False)
+        try:
+            with yt_dlp.YoutubeDL(scan_opts) as ydl:
+                info = ydl.extract_info(tab, download=False)
+        except Exception as exc:
+            log(f"  note: tab scan failed: {exc}")
+            info = None
         if not info:
             continue
         chan_name = chan_name or (info.get("channel") or info.get("uploader")
@@ -1243,6 +1288,31 @@ def scan_channel(url: str, args) -> tuple[str, list]:
                 "short": bool(is_short_tab or e.get("shorts_only") or
                               (e.get("duration") or 0) and (e.get("duration") or 0) <= 0),
             })
+    # Fallback: if tab scanning found 0 entries, try scanning the direct URL
+    if not videos:
+        try:
+            with yt_dlp.YoutubeDL(scan_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info:
+                chan_name = chan_name or (info.get("channel") or info.get("uploader")
+                                          or info.get("title") or "channel")
+                for e in (info.get("entries") or []):
+                    if not e or not e.get("id"):
+                        continue
+                    if e["id"] in seen:
+                        continue
+                    seen.add(e["id"])
+                    videos.append({
+                        "id": e.get("id"),
+                        "title": e.get("title") or e.get("id"),
+                        "url": e.get("webpage_url") or f"https://www.youtube.com/watch?v={e.get('id')}",
+                        "duration": e.get("duration"),
+                        "channel": e.get("channel") or e.get("uploader") or chan_name,
+                        "short": bool(e.get("shorts_only") or
+                                      (e.get("duration") or 0) and (e.get("duration") or 0) <= 0),
+                    })
+        except Exception:
+            pass
     return (chan_name or "channel"), videos
 
 
@@ -2109,9 +2179,11 @@ def scan_report_pipeline(args) -> int:
     """Dry-run: scan every target and log a detailed availability report.
     Returns 0 ok, 1 some sources failed, 130 stopped by user."""
     log("── SCAN REPORT ───────────────────────────────────────────────")
+    _probe_browser_cookies(args)
     try:
         fails = 0
-        targets = [t for t in args.targets if t]
+        raw_targets = [t for t in args.targets if t]
+        targets = [clean_url(t) for t in raw_targets if clean_url(t)]
         for i, url in enumerate(targets, 1):
             _check_cancel()
             tag = f"[{i}/{len(targets)}]"

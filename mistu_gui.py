@@ -942,16 +942,18 @@ class App(tk.Tk):
         if self.worker and self.worker.is_alive():
             messagebox.showinfo(APP_TITLE, "Already running — use Stop first.")
             return
-        targets = [ln.strip() for ln
-                   in self.url_text.get("1.0", "end").splitlines()
-                   if ln.strip() and not ln.strip().startswith("#")]
+        raw_lines = [ln.strip() for ln
+                     in self.url_text.get("1.0", "end").splitlines()
+                     if ln.strip() and not ln.strip().startswith("#")]
+        targets = [engine.clean_url(ln) for ln in raw_lines if engine.clean_url(ln)]
         if not targets:
             messagebox.showwarning(APP_TITLE, "Enter at least one URL or a channel.")
             return
 
         ns = engine.parse_args([""])
         ns.targets = targets
-        ns.cookies = self.cookies_var.get().strip() or None
+        raw_cookie = self.cookies_var.get().strip().strip("'\"")
+        ns.cookies = os.path.normpath(raw_cookie) if raw_cookie else None
         ns.shorts = self.shorts_var.get()
         try:
             ns.min_length = to_seconds(self.minlen_var.get())
@@ -1011,9 +1013,10 @@ class App(tk.Tk):
         if self.worker and self.worker.is_alive():
             messagebox.showinfo(APP_TITLE, "Already running — use Stop first.")
             return
-        targets = [ln.strip() for ln
-                   in self.url_text.get("1.0", "end").splitlines()
-                   if ln.strip() and not ln.strip().startswith("#")]
+        raw_lines = [ln.strip() for ln
+                     in self.url_text.get("1.0", "end").splitlines()
+                     if ln.strip() and not ln.strip().startswith("#")]
+        targets = [engine.clean_url(ln) for ln in raw_lines if engine.clean_url(ln)]
         if not targets:
             messagebox.showwarning(APP_TITLE, "Enter at least one URL or a channel.")
             return
@@ -1072,7 +1075,8 @@ class App(tk.Tk):
         except ValueError:
             messagebox.showerror(APP_TITLE, "Stall timeout must be a number of minutes.")
             return
-        ns.cookies = self.cookies_var.get().strip() or None
+        raw_cookie = self.cookies_var.get().strip().strip("'\"")
+        ns.cookies = os.path.normpath(raw_cookie) if raw_cookie else None
         ns.subs = self.subs_var.get()
         ns.subs_langs = self.subslangs_var.get().strip() or "en.*"
         ns.no_thumb = self.nothumb_var.get()
