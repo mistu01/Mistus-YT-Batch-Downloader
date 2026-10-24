@@ -21,13 +21,22 @@ import sys
 import tempfile
 import threading
 import time
+
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FutTimeout  # noqa: F401 (reserved)
 from urllib.parse import urlparse
 import socket
 import urllib.request
 
-__version__ = "2.9.1"
+__version__ = "2.9.2"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -780,8 +789,11 @@ def make_hook(prefix: str, parallel: bool):
             elif not parallel:
                 title = _item_title(d)
                 with PRINT_LOCK:
-                    print(f"\r{prefix} {title:<48.48} [########################] 100.0%"
-                          f" — merging / processing…", flush=True)
+                    try:
+                        print(f"\r{prefix} {title:<48.48} [########################] 100.0%"
+                              f" — merging / processing…", flush=True)
+                    except Exception:
+                        pass
     return hook
 
 
@@ -804,22 +816,28 @@ _RETRYABLE_RE = re.compile(
     r"|stalled",
     re.I)
 
-# Fallback ladder of modern player clients that bypass YouTube restrictions.
-# Cookies are ALWAYS preserved and never dropped.
+# Fallback ladder of robust player clients that bypass YouTube restrictions.
+# Tries cookied passes first (for age-gated/private content), followed by cookieless
+# rescue passes in case session cookies poison the public video streams.
 _PLAYER_FALLBACKS = [
-    ({"youtube": {"player_client": ["web"]}}, False),
-    ({"youtube": {"player_client": ["mweb"]}}, False),
-    ({"youtube": {"player_client": ["ios"]}}, False),
-    ({"youtube": {"player_client": ["tv"]}}, False),
-    ({"youtube": {"player_client": ["web_creator", "mweb"]}}, False),
+    # Pass 1: visionos (with cookies) — provides full DASH audio & video without desktop PO-token blocks
+    ({"youtube": {"player_client": ["visionos"]}}, False),
+    # Pass 2: android + web (with cookies) — alternative mobile/web endpoints
+    ({"youtube": {"player_client": ["android", "web"]}}, False),
+    # Pass 3: visionos (cookieless rescue) — in case session cookies poison public video extraction
+    ({"youtube": {"player_client": ["visionos"]}}, True),
+    # Pass 4: android + web (cookieless rescue)
+    ({"youtube": {"player_client": ["android", "web"]}}, True),
+    # Pass 5: default client (cookieless rescue)
+    (None, True),
 ]
 
 _PLAYER_NAMES = {
-    1: "web client",
-    2: "mweb (mobile web)",
-    3: "ios client",
-    4: "tv client",
-    5: "web_creator + mweb",
+    1: "visionos (with cookies)",
+    2: "android + web (with cookies)",
+    3: "visionos (cookieless rescue)",
+    4: "android + web (cookieless rescue)",
+    5: "default client (cookieless rescue)",
 }
 
 
@@ -830,10 +848,11 @@ def _all_passes() -> list:
 
 def _pass_signature(pos: int) -> str:
     """Stable string id for a pass (survives ladder reorderings)."""
-    clients, _ = _all_passes()[pos]
+    clients, drop = _all_passes()[pos]
+    tag = "|nocookie" if drop else ""
     if clients is None:
-        return "default"
-    return "+".join(clients["youtube"]["player_client"])
+        return "default" + tag
+    return ("+".join(clients["youtube"]["player_client"]) + tag)
 
 
 def _signature_index(sig: str):
@@ -863,8 +882,11 @@ def _adaptive_load(cookiefile: str):
                 data = json.load(fh)
             if data.get("cookiefile", "") == key:
                 s = str(data.get("win", ""))
-                if _signature_index(s) is not None:
-                    sig = s
+                # Reject obsolete or broken signatures from previous versions
+                bad_sigs = ("web_creator", "mweb", "ios", "tv_embedded", "mediaconnect")
+                if s and not any(bad in s for bad in bad_sigs) and s != "web" and s != "tv":
+                    if _signature_index(s) is not None:
+                        sig = s
         except Exception:
             sig = None
         _ADAPTIVE_MEMO[key] = sig
@@ -885,7 +907,7 @@ def _with_player_fallbacks(base_opts: dict, prefix: str, run):
     """Run `run(ydl)` across player-client passes when YouTube blocks/throttles/404s.
 
     Order: the previously-learned winning pass (if any), then the configured
-    pass, then the client ladder. User cookies are ALWAYS preserved and utilized.
+    pass, then the client ladder.
     Raises the last error when every pass fails; RunCancelled / KeyboardInterrupt pass through untouched."""
     passes = _all_passes()
     ckey = _session_key(base_opts)
@@ -897,10 +919,18 @@ def _with_player_fallbacks(base_opts: dict, prefix: str, run):
     for pos in order:
         _check_cancel()
         opts = base_opts
-        clients, _ = passes[pos]
-        if clients is not None:
+        clients, drop_cookies = passes[pos]
+        if clients is not None or drop_cookies:
             opts = dict(base_opts)
-            opts["extractor_args"] = clients
+            if clients is not None:
+                opts["extractor_args"] = clients
+            else:
+                opts.pop("extractor_args", None)
+            if drop_cookies:
+                opts.pop("cookiefile", None)
+                opts.pop("cookiesfrombrowser", None)
+                if "http_headers" in opts and isinstance(opts["http_headers"], dict):
+                    opts["http_headers"] = {k: v for k, v in opts["http_headers"].items() if k.lower() != "cookie"}
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 result = run(ydl)
@@ -920,6 +950,8 @@ def _with_player_fallbacks(base_opts: dict, prefix: str, run):
             msg = str(exc).replace("\n", " ")
             if msg.startswith("ERROR: "):
                 msg = msg[len("ERROR: "):]
+            if win is not None and pos == win:
+                _adaptive_save(ckey, None)
             remaining = order[order.index(pos) + 1:]
             if remaining and _RETRYABLE_RE.search(msg):
                 _close_ytdlp_cache()
