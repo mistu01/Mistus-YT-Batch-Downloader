@@ -36,7 +36,7 @@ from urllib.parse import urlparse
 import socket
 import urllib.request
 
-__version__ = "2.9.2"
+__version__ = "2.9.3"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -1378,9 +1378,13 @@ def _fmt_dur(seconds) -> str:
 
 def _clean_title(title: str, channel: str | None = None) -> str:
     cleaned = strip_channel_from_title(title, channel)
-    t = yt_dlp.utils.sanitize_filename(str(cleaned), restricted=True)
-    t = re.sub(r"\s+", "_", t.strip()) or "untitled"
-    return t[:100]
+    # restricted=False preserves all Unicode languages (Bengali, Hindi, Arabic, Japanese, etc.)
+    # while replacing illegal filesystem characters with safe alternatives.
+    t = yt_dlp.utils.sanitize_filename(str(cleaned), restricted=False)
+    # Strip any remaining illegal Windows filesystem chars (< > : " / \ | ? * and control chars)
+    t = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", t)
+    t = re.sub(r"[\s_]+", "_", t.strip()).strip(" ._")
+    return (t[:100].strip(" ._") if t else "untitled")
 
 
 def _build_dir_cache(dirs: dict, chan_name: str | None = None) -> dict:
@@ -1712,7 +1716,7 @@ def _fetch_transcript(url: str, langs: list, workdir: str, args) -> tuple[str, s
     return ("", "")
 
 
-def write_info_txt(path: str, vid, info, transcript: str, t_lang: str, channel: str | None = None) -> None:
+def write_info_txt(path: str, vid, info, channel: str | None = None, *args, **kwargs) -> None:
     chan = channel or info.get("channel") or info.get("uploader")
     raw_title = info.get("title") or vid.get("title") or ""
     clean_title = strip_channel_from_title(raw_title, chan)
@@ -1730,9 +1734,6 @@ def write_info_txt(path: str, vid, info, transcript: str, t_lang: str, channel: 
         f"Tags: {', '.join(tags) if tags else '(none)'}",
         "Music information:",
         _music_info(info, channel=chan),
-        "",
-        f"Transcription{(f' [{t_lang}]' if t_lang else '')}:",
-        transcript or "(no captions available)",
     ]
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -1884,14 +1885,6 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
     if not info:
         return False, "metadata extraction failed", False
 
-    # ---- transcript (only if the info txt is missing) ----
-    if info_done:
-        t_lang, transcript = "", ""
-    else:
-        with tempfile.TemporaryDirectory(prefix="mistu-cap-") as capdir:
-            t_lang, transcript = _fetch_transcript_from_info(
-                info, ["en-orig", "en.*"], capdir, args)
-
     # ---- audio (mp3/m4a/... via bundled ffmpeg) ----
     if not audio_done:
         audio_format = args.audio_format or "mp3"
@@ -1964,7 +1957,7 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
 
     # ---- info txt ----
     if not info_done:
-        write_info_txt(os.path.join(info_dir, stem + ".txt"), vid, info, transcript, t_lang, channel=c_name)
+        write_info_txt(os.path.join(info_dir, stem + ".txt"), vid, info, channel=c_name)
         log(f"{prefix} ✓ info saved: Text File/{stem}.txt")
 
     if dir_cache is not None:
