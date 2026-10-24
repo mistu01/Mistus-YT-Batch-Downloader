@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 import socket
 import urllib.request
 
-__version__ = "2.8.0"
+__version__ = "2.9.0"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -45,30 +45,93 @@ except Exception:  # pragma: no cover
     _BasePP = object
 
 
+def strip_channel_from_title(title: str, channel: str | None = None) -> str:
+    """Strip channel name and channel branding from video title."""
+    if not title:
+        return "untitled"
+    t = str(title).strip()
+    if not channel:
+        return t
+
+    c = str(channel).strip()
+    if not c or len(c) < 2:
+        return t
+
+    c_clean = c.lstrip("@#").strip()
+    c_nospace = re.sub(r"\s+", "", c_clean)
+
+    variants = {re.escape(c), re.escape(c_clean)}
+    if c_nospace and len(c_nospace) > 2:
+        variants.add(re.escape(c_nospace))
+
+    # Also strip common channel suffixes like 'Official', 'Music', 'Records', 'VEVO', 'Channel'
+    c_sub = re.sub(r"(?i)\s*(?:official|music|records|vevo|channel|tv|topic)\b", "", c_clean).strip()
+    if len(c_sub) > 2:
+        variants.add(re.escape(c_sub))
+        variants.add(re.escape(re.sub(r"\s+", "", c_sub)))
+
+    all_keys = list(variants)
+    for k in all_keys:
+        variants.add(r"#" + k)
+        variants.add(r"@" + k)
+
+    c_pattern = "|".join(sorted(variants, key=len, reverse=True))
+
+    # 1. Bracketed or parenthesized channel at start: '[Radio Milan] Song' or '(Radio Milan) Song'
+    t = re.sub(rf"^\s*(?:\[|\(|\{{)\s*(?:{c_pattern})\s*(?:\]|\)|\}})\s*[-–—|:•~·/\\#]*\s*", "", t, flags=re.I)
+
+    # 2. Prefix with separator: 'Radio Milan - Song' or '#RadioMilan | Song'
+    t = re.sub(rf"^\s*(?:{c_pattern})\s*[-–—|:•~·/\\#]+\s*", "", t, flags=re.I)
+
+    # 3. Bracketed or parenthesized channel at end: 'Song [Radio Milan]'
+    t = re.sub(rf"\s*[-–—|:•~·/\\#]*\s*(?:\[|\(|\{{)\s*(?:{c_pattern})\s*(?:\]|\)|\}})\s*$", "", t, flags=re.I)
+
+    # 4. Suffix with separator: 'Song - Radio Milan' or 'Song | #RadioMilan'
+    t = re.sub(rf"\s*[-–—|:•~·/\\#]+\s*(?:{c_pattern})\s*$", "", t, flags=re.I)
+
+    # 5. 'by Radio Milan' or 'from Radio Milan'
+    t = re.sub(rf"\s+(?:by|from|via)\s+(?:{c_pattern})\s*$", "", t, flags=re.I)
+
+    # 6. Trailing hashtag or mention
+    t = re.sub(rf"\s+(?:#|@)(?:{c_pattern})\b\s*$", "", t, flags=re.I)
+
+    t = re.sub(r"\s+", " ", t).strip(" -–—|:•~·/\\#_")
+    return t or str(title).strip()
+
+
 class _SetMusicMetaPP(_BasePP):
     """Post-processor that writes final audio tags:
-    artist  = user-entered artist, else channel/uploader
-    title   = user-entered song title, else the video title."""
+    title / track = video title (stripped of channel name)
+    artist / album_artist / creator = user-specified artist (if provided), or legitimate track artist (NEVER channel name)."""
 
-    def __init__(self, downloader, artist=None, title=None):
+    def __init__(self, downloader, artist=None, title=None, channel=None):
         super().__init__(downloader)
         self._artist = artist
         self._title = title
+        self._channel = channel
 
     def run(self, info):
-        artist = (self._artist
-                  or info.get("channel")
-                  or info.get("uploader")
-                  or info.get("creator")
-                  or info.get("uploader_id")
-                  or "Unknown Artist")
+        raw_title = self._title or info.get("title") or info.get("track") or "Unknown Title"
+        chan = self._channel or info.get("channel") or info.get("uploader")
+        clean_title = strip_channel_from_title(raw_title, chan)
+
+        info["title"] = clean_title
+        info["track"] = clean_title
+
+        # Requirement: do NOT save channel name in the file title or internal metadata name
+        if self._artist:
+            artist = self._artist
+        else:
+            cand = info.get("artist") or (info.get("artists")[0] if info.get("artists") else None)
+            if cand and str(cand).lower() not in (str(chan or "").lower(), str(info.get("uploader") or "").lower(), str(info.get("uploader_id") or "").lower()):
+                artist = strip_channel_from_title(cand, chan)
+            else:
+                artist = ""
+
         info["artist"] = artist
-        info["artists"] = [artist]
+        info["artists"] = [artist] if artist else []
         info["creator"] = artist
         info["album_artist"] = artist
-        info["track"] = self._title or info.get("track") or info.get("title") or "Unknown Title"
-        if self._title:
-            info["title"] = self._title
         return [], info
 
 # ---------------------------------------------------------------- console ---
@@ -588,6 +651,7 @@ def build_ydl_opts(args, ffmpeg_dir, archive, hook):
         "extractor_retries": 3,
         "source_address": "0.0.0.0",      # force IPv4 to avoid IPv6 routing stalls
         "socket_timeout": 30,
+        "http_chunk_size": 10485760,      # 10MB chunking prevents YouTube SABR throttling
         "ignoreerrors": False,
         "concurrent_fragment_downloads": 4,
         "noplaylist": args.no_playlist,
@@ -709,26 +773,36 @@ _RETRYABLE_RE = re.compile(
     r"|not a bot"
     r"|429|too many requests"
     r"|403|forbidden"
+    r"|404|not found"
+    r"|unable to download video data"
     r"|sign in to confirm"
     r"|try again later"
-    r"|requested format is not available",
+    r"|requested format is not available"
+    r"|fragment.*failed"
+    r"|content is not available"
+    r"|video unavailable"
+    r"|connection reset"
+    r"|remote end closed"
+    r"|sabr"
+    r"|stalled",
     re.I)
 
-# Fallback ladder of player clients that bypass bot-gated webpage state
-# (no PO-token path used by community fallbacks; run as sequential passes).
-# Cookieless entries come FIRST: exported web-session cookies are the most
-# common cause of "The page needs to be reloaded" on watch pages, and public
-# videos never need them. A cookied try stays last (age-gated videos).
+# Fallback ladder of modern player clients that bypass YouTube restrictions.
+# Cookies are ALWAYS preserved and never dropped.
 _PLAYER_FALLBACKS = [
-    ({"youtube": {"player_client": ["android", "web_safari"]}}, True),
-    ({"youtube": {"player_client": ["tv_simply"]}}, True),
-    ({"youtube": {"player_client": ["android", "web_safari"]}}, False),
+    ({"youtube": {"player_client": ["web"]}}, False),
+    ({"youtube": {"player_client": ["mweb"]}}, False),
+    ({"youtube": {"player_client": ["ios"]}}, False),
+    ({"youtube": {"player_client": ["tv"]}}, False),
+    ({"youtube": {"player_client": ["web_creator", "mweb"]}}, False),
 ]
 
 _PLAYER_NAMES = {
-    1: "android + web_safari (no cookies)",
-    2: "tv_simply (no cookies)",
-    3: "android + web_safari (logged in)",
+    1: "web client",
+    2: "mweb (mobile web)",
+    3: "ios client",
+    4: "tv client",
+    5: "web_creator + mweb",
 }
 
 
@@ -739,11 +813,10 @@ def _all_passes() -> list:
 
 def _pass_signature(pos: int) -> str:
     """Stable string id for a pass (survives ladder reorderings)."""
-    clients, drop = _all_passes()[pos]
+    clients, _ = _all_passes()[pos]
     if clients is None:
         return "default"
-    return ("+".join(clients["youtube"]["player_client"])
-            + ("|nocookie" if drop else ""))
+    return "+".join(clients["youtube"]["player_client"])
 
 
 def _signature_index(sig: str):
@@ -792,12 +865,11 @@ def _adaptive_save(cookiefile: str, sig: str | None) -> None:
 
 
 def _with_player_fallbacks(base_opts: dict, prefix: str, run):
-    """Run `run(ydl)` across player-client passes when YouTube hard-blocks.
+    """Run `run(ydl)` across player-client passes when YouTube blocks/throttles/404s.
 
     Order: the previously-learned winning pass (if any), then the configured
-    pass, then the client ladder (cookieless entries first). Fresh cache
-    between passes. Raises the last error when every pass fails;
-    RunCancelled / KeyboardInterrupt pass through untouched."""
+    pass, then the client ladder. User cookies are ALWAYS preserved and utilized.
+    Raises the last error when every pass fails; RunCancelled / KeyboardInterrupt pass through untouched."""
     passes = _all_passes()
     ckey = _session_key(base_opts)
     win = _signature_index(_adaptive_load(ckey))
@@ -808,13 +880,10 @@ def _with_player_fallbacks(base_opts: dict, prefix: str, run):
     for pos in order:
         _check_cancel()
         opts = base_opts
-        clients, drop_cookies = passes[pos]
+        clients, _ = passes[pos]
         if clients is not None:
             opts = dict(base_opts)
             opts["extractor_args"] = clients
-            if drop_cookies:
-                opts.pop("cookiefile", None)
-                opts.pop("cookiesfrombrowser", None)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 result = run(ydl)
@@ -837,8 +906,8 @@ def _with_player_fallbacks(base_opts: dict, prefix: str, run):
             remaining = order[order.index(pos) + 1:]
             if remaining and _RETRYABLE_RE.search(msg):
                 _close_ytdlp_cache()
-                log(f"{prefix} · hard block ({msg[:120]}) — retrying with an "
-                    "alternate player / fresh cache…")
+                next_desc = _PLAYER_NAMES.get(remaining[0], "next player client")
+                log(f"{prefix} · stream error ({msg[:100]}) — trying {next_desc}…")
                 continue
             raise
 
@@ -905,55 +974,130 @@ def _is_browser_cookie(value) -> bool:
     return _parse_browser_cookie(value) is not None
 
 
+def sanitize_cookie_file(src_path: str, dst_path: str) -> int:
+    """Read exported cookie file (from Chrome/Firefox extension or DevTools),
+    handling any encoding (UTF-8 with/without BOM, UTF-16, Latin-1),
+    standardizing Netscape formatting, and writing a clean UTF-8 file."""
+    if not os.path.isfile(src_path):
+        return 0
+    raw = None
+    for enc in ("utf-8-sig", "utf-8", "utf-16", "latin-1"):
+        try:
+            with open(src_path, "r", encoding=enc) as fh:
+                raw = fh.read()
+            break
+        except (UnicodeDecodeError, OSError):
+            continue
+    if raw is None:
+        try:
+            with open(src_path, "r", encoding="utf-8", errors="replace") as fh:
+                raw = fh.read()
+        except OSError:
+            return 0
+
+    lines = raw.splitlines()
+    clean_lines = [
+        "# Netscape HTTP Cookie File",
+        "# http://curl.haxx.se/rfc/cookie_spec.html",
+        "# Sanitized for yt-dlp by Mistu YT Downloader",
+        "",
+    ]
+    cookie_count = 0
+    for line in lines:
+        s = line.strip()
+        if not s or (s.startswith("#") and not s.startswith("#HttpOnly_")):
+            continue
+        is_httponly = False
+        if s.startswith("#HttpOnly_"):
+            is_httponly = True
+            s = s[len("#HttpOnly_"):].strip()
+        parts = s.split("\t")
+        if len(parts) < 7:
+            parts = re.split(r"\s{2,}", s)
+        if len(parts) >= 7:
+            domain, sub, path, secure, expiry, name = parts[:6]
+            value = "\t".join(parts[6:])
+            prefix = "#HttpOnly_" if is_httponly else ""
+            clean_lines.append(f"{prefix}{domain}\t{sub}\t{path}\t{secure}\t{expiry}\t{name}\t{value}")
+            cookie_count += 1
+        elif len(parts) == 6:
+            domain, sub, path, secure, expiry, name = parts
+            prefix = "#HttpOnly_" if is_httponly else ""
+            clean_lines.append(f"{prefix}{domain}\t{sub}\t{path}\t{secure}\t{expiry}\t{name}\t")
+            cookie_count += 1
+
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(dst_path)), exist_ok=True)
+        with open(dst_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(clean_lines) + "\n")
+        return cookie_count
+    except OSError:
+        return 0
+
+
+_ACTIVE_COOKIE_PATH = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")),
+    "MistusBatchYTDownloader", "active_cookies.txt")
+
+
 def cookieopts(args) -> dict:
     """Cookie options for the ydl opts dict. Accepts a cookies.txt PATH or
-    a live browser NAME (firefox / chrome / chrome:Profile 2 / …). Live
-    browser cookies are the reliable long-run choice: they never expire
-    between runs (a stale export file is the #1 long-run error source)."""
+    a live browser NAME (firefox / chrome / chrome:Profile 2 / …)."""
     c = getattr(args, "cookies", None)
     if not c:
         return {}
+    std_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     parsed = _parse_browser_cookie(c)
     if parsed:
-        return {"cookiesfrombrowser": parsed}
-    return {"cookiefile": c}
+        return {
+            "cookiesfrombrowser": parsed,
+            "http_headers": std_headers,
+        }
+    if os.path.isfile(c):
+        count = sanitize_cookie_file(c, _ACTIVE_COOKIE_PATH)
+        if count > 0:
+            return {
+                "cookiefile": _ACTIVE_COOKIE_PATH,
+                "http_headers": std_headers,
+            }
+    return {
+        "cookiefile": c,
+        "http_headers": std_headers,
+    }
 
 
 def _probe_browser_cookies(args) -> bool:
-    """Pre-flight load of live-browser cookies, once per run.
-
-    Returns True when cookies are usable (or the input is not a browser).
-    On failure it logs the reason plus the concrete fix and switches the
-    whole run to cookieless — far better than a raw traceback mid-scan.
-    The main real-world failure is Chrome 127+ 'app-bound encryption'
-    (yt-dlp issue #10927): Google encrypts Chrome's cookie DB so that only
-    Chrome itself can decrypt it; no external tool can read it anymore."""
-    parsed = _parse_browser_cookie(getattr(args, "cookies", None))
-    if not parsed:
+    """Pre-flight check of cookies (live-browser or exported cookies.txt)."""
+    c = getattr(args, "cookies", None)
+    if not c:
         return True
-    name, prof = parsed
-    try:
-        from yt_dlp.cookies import extract_cookies_from_browser
-        jar = extract_cookies_from_browser(name, prof)
-        log(f"· cookies: live browser session via {name}"
-            + (f" (profile '{prof}')" if prof else " (default profile)")
-            + f" — {len(jar)} cookies, always fresh")
+    parsed = _parse_browser_cookie(c)
+    if parsed:
+        name, prof = parsed
+        try:
+            from yt_dlp.cookies import extract_cookies_from_browser
+            jar = extract_cookies_from_browser(name, prof)
+            log(f"· cookies: live browser session via {name}"
+                + (f" (profile '{prof}')" if prof else " (default profile)")
+                + f" — {len(jar)} cookies, always fresh")
+            return True
+        except Exception as exc:
+            msg = str(exc).replace("\n", " ")
+            log(f"· cookies: browser '{name}' could not be read — {msg[:140]}")
+            if "dpapi" in msg.lower() or "decrypt" in msg.lower():
+                log("· cookies: Chrome 127+ app-bound encryption prevents external tools from reading Chrome's live sqlite.")
+                log("  Working solution: export cookies.txt using a Chrome/Firefox extension and select that file.")
+            else:
+                log("· cookies: please use an exported cookies.txt file instead.")
+            return False
+    elif os.path.isfile(c):
+        count = sanitize_cookie_file(c, _ACTIVE_COOKIE_PATH)
+        log(f"· cookies: loaded {os.path.basename(c)} ({count} cookies active, sanitized Netscape format)")
         return True
-    except Exception as exc:
-        msg = str(exc).replace("\n", " ")
-        log(f"· cookies: browser '{name}' could not be read — {msg[:140]}")
-        if "dpapi" in msg.lower() or "decrypt" in msg.lower():
-            log("· cookies: this is Chrome 127+ 'app-bound encryption' — Google")
-            log("  blocks ALL external tools from decrypting (yt-dlp issue #10927).")
-            log("  Working fixes:  1) type  firefox  in the cookies field (Firefox")
-            log("  has no encryption wall), or  2) export cookies.txt with the")
-            log("  'Get cookies.txt LOCALLY' Chrome extension and select that file.")
-        else:
-            log("· cookies: fix the browser session, or use a cookies.txt file instead.")
-        log("· cookies: continuing WITHOUT cookies — public channels work fine")
-        log("  (the player-fallback ladder is cookieless-first by design).")
-        args.cookies = None
-        return False
+    return True
 
 
 def _session_key(opts: dict) -> str:
@@ -1095,6 +1239,7 @@ def scan_channel(url: str, args) -> tuple[str, list]:
                 "title": e.get("title") or e.get("id"),
                 "url": e.get("webpage_url") or f"https://www.youtube.com/watch?v={e.get('id')}",
                 "duration": e.get("duration"),
+                "channel": e.get("channel") or e.get("uploader") or chan_name,
                 "short": bool(is_short_tab or e.get("shorts_only") or
                               (e.get("duration") or 0) and (e.get("duration") or 0) <= 0),
             })
@@ -1129,35 +1274,119 @@ def _fmt_dur(seconds) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def _clean_title(title: str) -> str:
-    t = yt_dlp.utils.sanitize_filename(str(title), restricted=True)
+def _clean_title(title: str, channel: str | None = None) -> str:
+    cleaned = strip_channel_from_title(title, channel)
+    t = yt_dlp.utils.sanitize_filename(str(cleaned), restricted=True)
     t = re.sub(r"\s+", "_", t.strip()) or "untitled"
     return t[:100]
+
+
+def _build_dir_cache(dirs: dict, chan_name: str | None = None) -> dict:
+    """Pre-scan all subdirectories once into fast in-memory sets for O(1) checks.
+    Returns:
+        audio_stems: set of stems in Audio/ that are complete (not .part, not .ytdl)
+        audio_numbers: set of prefix numbers that have complete audio
+        thumb_stems: set of stems in Thumbnail/ that are complete
+        thumb_numbers: set of prefix numbers that have thumbnails
+        info_stems: set of stems in Text File/ (.txt)
+        info_numbers: set of prefix numbers that have .txt
+        known: dict mapping title_key -> int(n)
+        highest: int
+    """
+    audio_stems: set[str] = set()
+    audio_numbers: set[int] = set()
+    thumb_stems: set[str] = set()
+    thumb_numbers: set[int] = set()
+    info_stems: set[str] = set()
+    info_numbers: set[int] = set()
+    known: dict[str, int] = {}
+    highest = 0
+
+    # 1. Audio dir
+    try:
+        for f in os.listdir(dirs["audio"]):
+            if f.endswith(".part") or f.endswith(".ytdl"):
+                continue
+            stem, _ = os.path.splitext(f)
+            audio_stems.add(stem)
+            m = re.match(r"^(\d+)_(.*)$", stem)
+            if m:
+                try:
+                    n = int(m.group(1))
+                    highest = max(highest, n)
+                    audio_numbers.add(n)
+                    raw_title = m.group(2)
+                    known.setdefault(raw_title, n)
+                    if chan_name:
+                        known.setdefault(_clean_title(raw_title, chan_name), n)
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+
+    # 2. Thumb dir
+    try:
+        for f in os.listdir(dirs["thumb"]):
+            if f.endswith(".part"):
+                continue
+            stem, ext = os.path.splitext(f)
+            if ext.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+                thumb_stems.add(stem)
+                m = re.match(r"^(\d+)_(.*)$", stem)
+                if m:
+                    try:
+                        n = int(m.group(1))
+                        highest = max(highest, n)
+                        thumb_numbers.add(n)
+                        raw_title = m.group(2)
+                        known.setdefault(raw_title, n)
+                        if chan_name:
+                            known.setdefault(_clean_title(raw_title, chan_name), n)
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+
+    # 3. Info dir
+    try:
+        for f in os.listdir(dirs["info"]):
+            if not f.endswith(".txt"):
+                continue
+            stem = f[:-4]
+            info_stems.add(stem)
+            m = re.match(r"^(\d+)_(.*)$", stem)
+            if m:
+                try:
+                    n = int(m.group(1))
+                    highest = max(highest, n)
+                    info_numbers.add(n)
+                    raw_title = m.group(2)
+                    known.setdefault(raw_title, n)
+                    if chan_name:
+                        known.setdefault(_clean_title(raw_title, chan_name), n)
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+
+    return {
+        "audio_stems": audio_stems,
+        "audio_numbers": audio_numbers,
+        "thumb_stems": thumb_stems,
+        "thumb_numbers": thumb_numbers,
+        "info_stems": info_stems,
+        "info_numbers": info_numbers,
+        "known": known,
+        "highest": highest,
+    }
 
 
 def _scan_prefixes(dirs: dict) -> tuple[dict, int]:
     """Inventory numbered files across the output subfolders.
 
     Returns (title_key -> existing number, highest number seen)."""
-    known: dict[str, int] = {}
-    highest = 0
-    for d in dirs.values():
-        try:
-            names = os.listdir(d)
-        except OSError:
-            continue
-        for name in names:
-            m = re.match(r"^(\d+)_(.*)$", name)
-            if not m:
-                continue
-            try:
-                n = int(m.group(1))
-            except ValueError:
-                continue
-            highest = max(highest, n)
-            key = os.path.splitext(m.group(2))[0]
-            known.setdefault(key, n)
-    return known, highest
+    cache = _build_dir_cache(dirs)
+    return cache["known"], cache["highest"]
 
 
 _GAP_SEEN: set[int] = set()
@@ -1197,8 +1426,13 @@ def _sync_manifest(man, man_path, no: int, vid) -> None:
     deletion of ALL files for that slot can still be re-filled precisely."""
     if man is None or man_path is None or no is None:
         return
-    man[str(no)] = {"title": vid.get("title") or "",
-                    "url": vid.get("url") or ""}
+    s_no = str(no)
+    existing = man.get(s_no)
+    cur_url = vid.get("url") or ""
+    cur_title = vid.get("title") or ""
+    if existing and existing.get("url") == cur_url and existing.get("title") == cur_title:
+        return
+    man[s_no] = {"title": cur_title, "url": cur_url}
     try:
         tmp = man_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -1229,7 +1463,7 @@ def _sibling_title(dirs: dict, n: int):
 
 
 def _plan_repairs(dirs: dict, highest: int, known: dict,
-                  manifest: dict) -> dict:
+                  manifest: dict, chan_name: str | None = None) -> dict:
     """Find audio slots 1..highest with no audio file and build refill
     candidates for each slot: (missing, by_url, by_title). The numbered
     manifest is the primary source, Thumbnail/Text File stems the fallback.
@@ -1241,7 +1475,7 @@ def _plan_repairs(dirs: dict, highest: int, known: dict,
     for n in missing:
         rec = manifest.get(str(n))
         if rec:
-            tkey = _clean_title(rec.get("title") or "")
+            tkey = _clean_title(rec.get("title") or "", channel=chan_name)
             # refill only when the item is not already saved elsewhere
             if rec.get("url") and known.get(tkey, n) == n:
                 by_url[rec["url"]] = n
@@ -1253,16 +1487,19 @@ def _plan_repairs(dirs: dict, highest: int, known: dict,
             "by_url": by_url, "by_title": by_title}
 
 
-def _music_info(info) -> str:
+def _music_info(info, channel: str | None = None) -> str:
+    chan = channel or info.get("channel") or info.get("uploader") or ""
     artists = info.get("artists") or info.get("artist") or []
     if isinstance(artists, list):
         artists = ", ".join(artists)
+    if artists and str(artists).lower() in (str(chan).lower(), str(info.get("uploader") or "").lower(), str(info.get("uploader_id") or "").lower()):
+        artists = ""
     composers = info.get("composer") or []
     if isinstance(composers, list):
         composers = ", ".join(composers)
     pairs = [
         ("Track", info.get("track")),
-        ("Artist", artists or info.get("creator") or info.get("uploader")),
+        ("Artist", artists),
         ("Album", info.get("album")),
         ("Composer", composers),
         ("Track number", info.get("track_number")),
@@ -1373,12 +1610,14 @@ def _fetch_transcript(url: str, langs: list, workdir: str, args) -> tuple[str, s
     return ("", "")
 
 
-def write_info_txt(path: str, vid, info, transcript: str, t_lang: str) -> None:
+def write_info_txt(path: str, vid, info, transcript: str, t_lang: str, channel: str | None = None) -> None:
+    chan = channel or info.get("channel") or info.get("uploader")
+    raw_title = info.get("title") or vid.get("title") or ""
+    clean_title = strip_channel_from_title(raw_title, chan)
     tags = info.get("tags") or []
     lines = [
         f"Video URL: {vid.get('url') or 'https://www.youtube.com/watch?v=' + str(vid.get('id'))}",
-        f"Video Title: {info.get('title') or vid.get('title')}",
-        f"Channel: {info.get('channel') or info.get('uploader') or ''}",
+        f"Video Title: {clean_title}",
         f"Upload date: {info.get('upload_date') or ''}",
         f"Duration: {_fmt_dur(info.get('duration'))}",
         f"Views: {info.get('view_count') or ''}",
@@ -1388,7 +1627,7 @@ def write_info_txt(path: str, vid, info, transcript: str, t_lang: str) -> None:
         "",
         f"Tags: {', '.join(tags) if tags else '(none)'}",
         "Music information:",
-        _music_info(info),
+        _music_info(info, channel=chan),
         "",
         f"Transcription{(f' [{t_lang}]' if t_lang else '')}:",
         transcript or "(no captions available)",
@@ -1470,12 +1709,16 @@ def _fetch_thumbnail(info, stem: str, thumb_dir: str, ffmpeg_dir, args) -> str |
 
 def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
                       dirs: dict, item_no: int | None = None,
-                      manifest=None, manifest_path: str | None = None) -> tuple:
+                      manifest=None, manifest_path: str | None = None,
+                      dir_cache: dict | None = None,
+                      chan_name: str | None = None) -> tuple:
     """Download audio + thumbnail + write info txt for one scanned video.
-    item_no is the file-number prefix (continues across sessions)."""
+    item_no is the file-number prefix (continues across sessions).
+    Returns (ok: bool, error: str|None, did_download: bool)."""
     _check_cancel()
     prefix = f"[{index}/{total}]"
-    safe = _clean_title(vid["title"])
+    c_name = chan_name or vid.get("channel") or vid.get("uploader")
+    safe = _clean_title(vid["title"], channel=c_name)
     stem = f"{item_no if item_no is not None else index}_{safe}"
     audio_dir, thumb_dir, info_dir = dirs["audio"], dirs["thumb"], dirs["info"]
     audio_dst = os.path.join(audio_dir, stem + ".%(ext)s")
@@ -1489,20 +1732,25 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
             except OSError:
                 pass
 
-    # ---- partial downloads are NOT done audio (a killed .part file must
-    # re-download next run, not be skipped as "already saved") -----------
-    audio_done = any(f.startswith(stem + ".")
-                     and ".part" not in f and not f.endswith(".ytdl")
-                     for f in os.listdir(audio_dir))
-    info_done = os.path.isfile(os.path.join(info_dir, stem + ".txt"))
-    thumb_done = _thumb_exists(thumb_dir, stem)
+    # ---- instant check: use in-memory dir_cache when provided ----
+    if dir_cache is not None:
+        audio_done = (stem in dir_cache.get("audio_stems", set())) or (item_no is not None and item_no in dir_cache.get("audio_numbers", set()))
+        thumb_done = (stem in dir_cache.get("thumb_stems", set())) or (item_no is not None and item_no in dir_cache.get("thumb_numbers", set()))
+        info_done = (stem in dir_cache.get("info_stems", set())) or (item_no is not None and item_no in dir_cache.get("info_numbers", set()))
+    else:
+        audio_done = any(f.startswith(stem + ".")
+                         and ".part" not in f and not f.endswith(".ytdl")
+                         for f in os.listdir(audio_dir))
+        info_done = os.path.isfile(os.path.join(info_dir, stem + ".txt"))
+        thumb_done = _thumb_exists(thumb_dir, stem)
 
     # ---- instant resume: fully saved items cost zero network calls ------
-    log(f"{prefix} ▸ {vid['title']} ({_fmt_dur(vid.get('duration'))})")
     if audio_done and info_done and thumb_done:
-        log(f"{prefix} ✓ skipped (already saved)")
+        log(f"{prefix} ✓ skipped: {safe} (already saved) — 100.0%")
         _sync_manifest(manifest, manifest_path, item_no, vid)
-        return True, None
+        return True, None, False
+
+    log(f"{prefix} ▸ {safe} ({_fmt_dur(vid.get('duration'))})")
 
     # ---- metadata ----
     meta_opts = {
@@ -1511,12 +1759,12 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
         "no_warnings": not args.verbose,
         "source_address": "0.0.0.0",      # force IPv4 to avoid IPv6 routing stalls
         "socket_timeout": 30,
-        "extractor_retries": 3,
+        "http_chunk_size": 10485760,      # 10MB chunking prevents YouTube SABR throttling
+        "extractor_retries": 5,
     }
     if args.cookies:
         meta_opts.update(cookieopts(args))
-    # cookie state can poison the watch page ("page needs to be reloaded")
-    # — reach for the same player-client ladder the downloads use
+
     stall_sec = getattr(args, "stall_timeout", 300.0)
     try:
         with DownloadWatchdog(timeout_sec=stall_sec, prefix=prefix) as wd:
@@ -1528,11 +1776,11 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
         mins = int(stall_sec / 60) if stall_sec >= 60 else stall_sec
         unit = "min" if stall_sec >= 60 else "sec"
         log(f"{prefix} ⚠ metadata extraction stalled (no response for {mins} {unit}) — skipping to next item")
-        return False, f"metadata stalled (no response for {mins} {unit})"
+        return False, f"metadata stalled (no response for {mins} {unit})", False
     except RunCancelled:
         raise
     if not info:
-        return False, "metadata extraction failed"
+        return False, "metadata extraction failed", False
 
     # ---- transcript (only if the info txt is missing) ----
     if info_done:
@@ -1564,13 +1812,17 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
             "noprogress": True,
             "progress_hooks": [make_hook(prefix, parallel=False)],
             "retries": args.retries,
+            "fragment_retries": args.retries,
             "source_address": "0.0.0.0",      # force IPv4 to avoid IPv6 routing stalls
-        "socket_timeout": 30,
-            "extractor_retries": 3,
+            "socket_timeout": 30,
+            "http_chunk_size": 10485760,      # 10MB chunking prevents YouTube SABR throttling
+            "extractor_retries": 5,
             "postprocessors": post,
         }
         if ffmpeg_dir:
             opts["ffmpeg_location"] = ffmpeg_dir
+        if args.cookies:
+            opts.update(cookieopts(args))
 
         def _run_audio(ydl):
             attach_watchdog_to_ydl(ydl)
@@ -1579,7 +1831,8 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
             try:
                 ydl.add_post_processor(
                     _SetMusicMetaPP(ydl, artist=artist,
-                                    title=song_title),
+                                    title=song_title,
+                                    channel=c_name),
                     when="pre_process")
             except Exception:
                 pass
@@ -1595,7 +1848,7 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
             unit = "min" if stall_sec >= 60 else "sec"
             log(f"{prefix} ⚠ download stalled (no data received for {mins} {unit}) — skipping to next item")
             _clean_partial_files(audio_dir, stem)
-            return False, f"download stalled (no data for {mins} {unit})"
+            return False, f"download stalled (no data for {mins} {unit})", True
         except RunCancelled:
             raise
 
@@ -1609,10 +1862,20 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
 
     # ---- info txt ----
     if not info_done:
-        write_info_txt(os.path.join(info_dir, stem + ".txt"), vid, info, transcript, t_lang)
+        write_info_txt(os.path.join(info_dir, stem + ".txt"), vid, info, transcript, t_lang, channel=c_name)
         log(f"{prefix} ✓ info saved: Text File/{stem}.txt")
+
+    if dir_cache is not None:
+        dir_cache.setdefault("audio_stems", set()).add(stem)
+        dir_cache.setdefault("thumb_stems", set()).add(stem)
+        dir_cache.setdefault("info_stems", set()).add(stem)
+        if item_no is not None:
+            dir_cache.setdefault("audio_numbers", set()).add(item_no)
+            dir_cache.setdefault("thumb_numbers", set()).add(item_no)
+            dir_cache.setdefault("info_numbers", set()).add(item_no)
+
     _sync_manifest(manifest, manifest_path, item_no, vid)
-    return True, None
+    return True, None, True
 
 
 def run_scan(url: str, args, ffmpeg_dir) -> tuple:
@@ -1646,9 +1909,10 @@ def run_scan(url: str, args, ffmpeg_dir) -> tuple:
     log(f"· output folder: {dest}")
     log(f"· subfolders: Audio / Thumbnail / Text File")
 
-    # numbering: continue right after the numbers already on disk; a title
-    # that exists reuses its old number (resume), new titles get fresh ones
-    known, highest = _scan_prefixes(dirs)
+    # Fast in-memory directory indexing
+    dir_cache = _build_dir_cache(dirs, chan_name=chan_name)
+    known = dir_cache["known"]
+    highest = dir_cache["highest"]
     next_no = highest + 1
     if highest:
         log(f"· found files up to #{highest} — numbering continues from #{next_no}")
@@ -1661,7 +1925,7 @@ def run_scan(url: str, args, ffmpeg_dir) -> tuple:
     if not os.path.isfile(m_path):
         log("· numbering manifest: _numbering.json (records every item's "
             "slot, title and url so deleted files can be re-filled)")
-    plan = _plan_repairs(dirs, highest, known, manifest)
+    plan = _plan_repairs(dirs, highest, known, manifest, chan_name=chan_name)
     by_url, by_title = plan["by_url"], plan["by_title"]
     missing = plan["missing"]
     if missing:
@@ -1684,27 +1948,50 @@ def run_scan(url: str, args, ffmpeg_dir) -> tuple:
 
     ok_n, fails = 0, []
     total = len(filtered)
+    did_download_last = False
+
     for i, vid in enumerate(filtered, 1):
-        key = _clean_title(vid["title"])
-        no = known.get(key)
+        _check_cancel()
+        safe = _clean_title(vid["title"], channel=chan_name)
+        no = known.get(safe)
         if no is None and vid["url"] in by_url:
             no = by_url.pop(vid["url"])
             log(f"[{i}/{total}] ⟳ re-filling deleted slot #{no}")
-        if no is None and key in by_title:
-            no = by_title.pop(key)
+        if no is None and safe in by_title:
+            no = by_title.pop(safe)
             log(f"[{i}/{total}] ⟳ re-filling deleted slot #{no}")
         if no is None:
             no = next_no
             next_no += 1
-        if i > 1 and args.scan_delay and args.scan_delay > 0:
-            # jittered latch sleep: pressing Stop cuts the delay instantly
+            known[safe] = no
+
+        stem = f"{no}_{safe}"
+
+        # FAST IN-MEMORY SKIP: if all 3 files exist, skip in ~0.0001s without any sleep delay
+        is_done = (
+            (stem in dir_cache["audio_stems"] or no in dir_cache["audio_numbers"]) and
+            (stem in dir_cache["thumb_stems"] or no in dir_cache["thumb_numbers"]) and
+            (stem in dir_cache["info_stems"] or no in dir_cache["info_numbers"])
+        )
+        if is_done:
+            log(f"[{i}/{total}] ✓ skipped: {safe} (already saved) — 100.0%")
+            _sync_manifest(manifest, m_path, no, vid)
+            ok_n += 1
+            continue
+
+        # Jitter delay applies ONLY when the previous item performed a real network download
+        if did_download_last and args.scan_delay and args.scan_delay > 0:
             wait = _delay_jitter(args.scan_delay)
             if wait and _CANCEL_LATCH.wait(wait):
                 _check_cancel()
+
         try:
-            ok, err = process_scan_item(i, total, vid, args, ffmpeg_dir, dirs,
-                                        item_no=no, manifest=manifest,
-                                        manifest_path=m_path)
+            ok, err, did_dl = process_scan_item(
+                i, total, vid, args, ffmpeg_dir, dirs,
+                item_no=no, manifest=manifest, manifest_path=m_path,
+                dir_cache=dir_cache, chan_name=chan_name
+            )
+            did_download_last = did_dl
         except KeyboardInterrupt:
             log(f"\n! interrupted at {i}/{total} — done items are kept; re-run to resume")
             raise
@@ -1716,7 +2003,7 @@ def run_scan(url: str, args, ffmpeg_dir) -> tuple:
                 msg += ("  [hint: YouTube is rate-limiting/throttling this IP — raise "
                         "--scan-delay, wait some minutes, or pass --cookies cookies.txt]")
             log(f"[{i}/{total}] ✗ FAILED: {msg[:200]}")
-            ok, err = False, msg
+            ok, err, did_download_last = False, msg, False
         if ok:
             ok_n += 1
         else:

@@ -892,7 +892,8 @@ class App(tk.Tk):
 
     def browse_cookies(self):
         path = filedialog.askopenfilename(
-            title="Select cookies.txt (Netscape format)")
+            title="Select cookies.txt (Netscape format)",
+            filetypes=[("Text files (*.txt)", "*.txt"), ("All files (*.*)", "*.*")])
         if path:
             self.cookies_var.set(path)
 
