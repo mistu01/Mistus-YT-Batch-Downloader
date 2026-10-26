@@ -36,7 +36,7 @@ from urllib.parse import urlparse
 import socket
 import urllib.request
 
-__version__ = "2.9.4"
+__version__ = "2.9.5"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
