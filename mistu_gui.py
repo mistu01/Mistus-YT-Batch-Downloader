@@ -1223,13 +1223,15 @@ class App(tk.Tk):
 
     @staticmethod
     def _classify(msg: str) -> str:
-        if "✗" in msg or "FAILED" in msg or ("error" in msg.lower()
-                                             and "not a bot" not in msg):
-            return "err"
+        # Check explicit success first so titles containing words like "terror" are never marked red
         if "✓" in msg or "✔" in msg:
             return "ok"
+        if "✗" in msg or "FAILED" in msg:
+            return "err"
         if "⚠" in msg or "stalled" in msg.lower() or msg.startswith("!") or "hint" in msg:
             return "warn"
+        if re.search(r"\berror\b", msg, re.I) and "not a bot" not in msg:
+            return "err"
         return "info"
 
     # -------------------------------------------------------- progress bar ---
