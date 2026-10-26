@@ -4,7 +4,7 @@ A simple Windows app to batch-download YouTube videos and channels.
 Downloads best-quality **MP3 audio**, **thumbnails**, and a **text info file** for every video.
 
 ```
-Mistus Batch YT Downloader v2.9.3
+Mistus Batch YT Downloader v2.9.4
 ```
 
 ## Install

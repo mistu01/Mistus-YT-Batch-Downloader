@@ -36,7 +36,7 @@ from urllib.parse import urlparse
 import socket
 import urllib.request
 
-__version__ = "2.9.3"
+__version__ = "2.9.4"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -683,6 +683,8 @@ def build_ydl_opts(args, ffmpeg_dir, archive, hook):
         "noplaylist": args.no_playlist,
         "writethumbnail": (not args.no_thumb) and has_ffmpeg,
         "postprocessors": postprocessors,
+        "js_runtimes": {"node": {}, "deno": {}, "bun": {}},
+        "remote_components": ["ejs:github"],
     }
     if ffmpeg_dir:
         opts["ffmpeg_location"] = ffmpeg_dir
@@ -807,37 +809,49 @@ _RETRYABLE_RE = re.compile(
     r"|sign in to confirm"
     r"|try again later"
     r"|requested format is not available"
+    r"|only images are available for download"
     r"|fragment.*failed"
     r"|content is not available"
     r"|video unavailable"
     r"|connection reset"
     r"|remote end closed"
     r"|sabr"
-    r"|stalled",
+    r"|stalled"
+    r"|failed to extract (?:any )?player response"
+    r"|all player responses are invalid"
+    r"|your ip is likely being blocked"
+    r"|no player clients have been requested"
+    r"|extractorerror"
+    r"|login required"
+    r"|this video is not available"
+    r"|confirm you are on the latest version"
+    r"|n challenge solving failed",
     re.I)
 
 # Fallback ladder of robust player clients that bypass YouTube restrictions.
 # Tries cookied passes first (for age-gated/private content), followed by cookieless
 # rescue passes in case session cookies poison the public video streams.
+# Note: visionos and android do not support cookies (yt-dlp rejects or strips them),
+# so they are strictly cookieless rescue passes.
 _PLAYER_FALLBACKS = [
-    # Pass 1: visionos (with cookies) — provides full DASH audio & video without desktop PO-token blocks
-    ({"youtube": {"player_client": ["visionos"]}}, False),
-    # Pass 2: android + web (with cookies) — alternative mobile/web endpoints
-    ({"youtube": {"player_client": ["android", "web"]}}, False),
-    # Pass 3: visionos (cookieless rescue) — in case session cookies poison public video extraction
-    ({"youtube": {"player_client": ["visionos"]}}, True),
-    # Pass 4: android + web (cookieless rescue)
-    ({"youtube": {"player_client": ["android", "web"]}}, True),
-    # Pass 5: default client (cookieless rescue)
+    # Pass 1: tv_samsung (with cookies) — authenticating TV client supporting cookies
+    ({"youtube": {"player_client": ["tv_samsung"]}}, False),
+    # Pass 2: default client (cookieless rescue) — immediately drops throttled cookies
     (None, True),
+    # Pass 3: visionos (cookieless rescue) — provides full DASH audio/video without bot blocks
+    ({"youtube": {"player_client": ["visionos"]}}, True),
+    # Pass 4: tv_samsung (cookieless rescue) — cookieless TV endpoint
+    ({"youtube": {"player_client": ["tv_samsung"]}}, True),
+    # Pass 5: android + web (cookieless rescue) — alternative mobile/web endpoints
+    ({"youtube": {"player_client": ["android", "web"]}}, True),
 ]
 
 _PLAYER_NAMES = {
-    1: "visionos (with cookies)",
-    2: "android + web (with cookies)",
+    1: "tv_samsung (with cookies)",
+    2: "default client (cookieless rescue)",
     3: "visionos (cookieless rescue)",
-    4: "android + web (cookieless rescue)",
-    5: "default client (cookieless rescue)",
+    4: "tv_samsung (cookieless rescue)",
+    5: "android + web (cookieless rescue)",
 }
 
 
@@ -884,7 +898,7 @@ def _adaptive_load(cookiefile: str):
                 s = str(data.get("win", ""))
                 # Reject obsolete or broken signatures from previous versions
                 bad_sigs = ("web_creator", "mweb", "ios", "tv_embedded", "mediaconnect")
-                if s and not any(bad in s for bad in bad_sigs) and s != "web" and s != "tv":
+                if s and not any(bad in s for bad in bad_sigs) and s != "web" and s != "tv" and s != "visionos":
                     if _signature_index(s) is not None:
                         sig = s
         except Exception:
@@ -903,7 +917,7 @@ def _adaptive_save(cookiefile: str, sig: str | None) -> None:
         pass
 
 
-def _with_player_fallbacks(base_opts: dict, prefix: str, run):
+def _with_player_fallbacks(base_opts: dict, prefix: str, run, learn: bool = True):
     """Run `run(ydl)` across player-client passes when YouTube blocks/throttles/404s.
 
     Order: the previously-learned winning pass (if any), then the configured
@@ -918,23 +932,25 @@ def _with_player_fallbacks(base_opts: dict, prefix: str, run):
             [i for i in range(len(passes)) if i != win]
     for pos in order:
         _check_cancel()
-        opts = base_opts
+        opts = dict(base_opts)
         clients, drop_cookies = passes[pos]
-        if clients is not None or drop_cookies:
-            opts = dict(base_opts)
-            if clients is not None:
-                opts["extractor_args"] = clients
-            else:
-                opts.pop("extractor_args", None)
-            if drop_cookies:
-                opts.pop("cookiefile", None)
-                opts.pop("cookiesfrombrowser", None)
-                if "http_headers" in opts and isinstance(opts["http_headers"], dict):
-                    opts["http_headers"] = {k: v for k, v in opts["http_headers"].items() if k.lower() != "cookie"}
+        if clients is not None:
+            opts["extractor_args"] = clients
+        else:
+            opts.pop("extractor_args", None)
+        if drop_cookies:
+            opts.pop("cookiefile", None)
+            opts.pop("cookiesfrombrowser", None)
+            if "http_headers" in opts and isinstance(opts["http_headers"], dict):
+                opts["http_headers"] = {k: v for k, v in opts["http_headers"].items() if k.lower() != "cookie"}
+        if "js_runtimes" not in opts:
+            opts["js_runtimes"] = {"node": {}, "deno": {}, "bun": {}}
+        if "remote_components" not in opts:
+            opts["remote_components"] = ["ejs:github"]
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 result = run(ydl)
-            if pos != 0 and _ADAPTIVE_MEMO.get(ckey) != _pass_signature(pos):
+            if learn and pos != 0 and _ADAPTIVE_MEMO.get(ckey) != _pass_signature(pos):
                 _adaptive_save(ckey, _pass_signature(pos))
                 log(f"{prefix} · learned: {_PLAYER_NAMES.get(pos, _pass_signature(pos))}"
                     " works in this session — trying it first from now on")
@@ -955,6 +971,7 @@ def _with_player_fallbacks(base_opts: dict, prefix: str, run):
             remaining = order[order.index(pos) + 1:]
             if remaining and _RETRYABLE_RE.search(msg):
                 _close_ytdlp_cache()
+                time.sleep(1.0)
                 next_desc = _PLAYER_NAMES.get(remaining[0], "next player client")
                 log(f"{prefix} · stream error ({msg[:100]}) — trying {next_desc}…")
                 continue
@@ -1213,7 +1230,7 @@ def download_one(index: int, total: int, url: str, args, ffmpeg_dir, archive) ->
             def _wrapped_run(ydl):
                 attach_watchdog_to_ydl(ydl)
                 _run(ydl)
-            _with_player_fallbacks(opts, prefix, _wrapped_run)
+            _with_player_fallbacks(opts, prefix, _wrapped_run, learn=True)
             log(f"{prefix} ✓ done")
             return True, None
     except KeyboardInterrupt:
@@ -1287,6 +1304,8 @@ def scan_channel(url: str, args) -> tuple[str, list]:
         "extractor_retries": 5,
         "ignoreerrors": True,          # skip dead members instead of dying
         "logger": None,
+        "js_runtimes": {"node": {}, "deno": {}, "bun": {}},
+        "remote_components": ["ejs:github"],
     }
     if args.cookies:
         scan_opts.update(cookieopts(args))
@@ -1706,7 +1725,7 @@ def _fetch_transcript(url: str, langs: list, workdir: str, args) -> tuple[str, s
     if args.cookies:
         opts.update(cookieopts(args))
     try:
-        _with_player_fallbacks(opts, "  ", lambda ydl: ydl.download([url]))
+        _with_player_fallbacks(opts, "  ", lambda ydl: ydl.download([url]), learn=False)
     except Exception as exc:
         if args.verbose:
             log(f"  note: caption fetch hiccup: {exc}")
@@ -1857,6 +1876,8 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
 
     # ---- metadata ----
     meta_opts = {
+        "skip_download": True,
+        "check_formats": False,
         "quiet": not args.verbose,
         "verbose": args.verbose,
         "no_warnings": not args.verbose,
@@ -1864,6 +1885,8 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
         "socket_timeout": 30,
         "http_chunk_size": 10485760,      # 10MB chunking prevents YouTube SABR throttling
         "extractor_retries": 5,
+        "js_runtimes": {"node": {}, "deno": {}, "bun": {}},
+        "remote_components": ["ejs:github"],
     }
     if args.cookies:
         meta_opts.update(cookieopts(args))
@@ -1874,7 +1897,7 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
             def _extract(ydl):
                 attach_watchdog_to_ydl(ydl)
                 return ydl.extract_info(vid["url"], download=False)
-            info = _with_player_fallbacks(meta_opts, prefix, _extract)
+            info = _with_player_fallbacks(meta_opts, prefix, _extract, learn=False)
     except DownloadStalled:
         mins = int(stall_sec / 60) if stall_sec >= 60 else stall_sec
         unit = "min" if stall_sec >= 60 else "sec"
@@ -1913,6 +1936,8 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
             "http_chunk_size": 10485760,      # 10MB chunking prevents YouTube SABR throttling
             "extractor_retries": 5,
             "postprocessors": post,
+            "js_runtimes": {"node": {}, "deno": {}, "bun": {}},
+            "remote_components": ["ejs:github"],
         }
         if ffmpeg_dir:
             opts["ffmpeg_location"] = ffmpeg_dir
@@ -1935,7 +1960,7 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
 
         try:
             with DownloadWatchdog(timeout_sec=stall_sec, prefix=prefix) as wd:
-                _with_player_fallbacks(opts, prefix, _run_audio)
+                _with_player_fallbacks(opts, prefix, _run_audio, learn=True)
                 _bitrate = " @ 320 kbps" if audio_format == "mp3" else ""
                 log(f"{prefix} ✓ audio saved: Audio/{stem}.{audio_format}{_bitrate}")
         except DownloadStalled:
@@ -2135,6 +2160,8 @@ def _scan_flat(url: str, args) -> tuple[str, list]:
         "socket_timeout": 30,
         "extractor_retries": 3,
         "ignoreerrors": True,
+        "js_runtimes": {"node": {}, "deno": {}, "bun": {}},
+        "remote_components": ["ejs:github"],
     }
     if getattr(args, "cookies", None):
         opts.update(cookieopts(args))
