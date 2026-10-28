@@ -839,6 +839,7 @@ class App(tk.Tk):
         self._apply_state(st)
         self.session_name_var.set(name)
         self._log(None, "head", f"♻ session loaded: {name}")
+        self._inspect_dest_status()
 
     def delete_session(self):
         name = self.session_pick_var.get().strip()
@@ -871,6 +872,62 @@ class App(tk.Tk):
                        "(auto-saved when the app was closed)")
             self._log(None, "info",
                       "· links, cookies, settings & download location back")
+            self._inspect_dest_status()
+
+    def _inspect_dest_status(self):
+        """Pre-flight check of output folder upon session load/restore.
+        Removes unconverted .webm files and audits mp3, thumbnail, and txt counts."""
+        dest = self.dest_var.get().strip()
+        if not dest or not os.path.isdir(dest):
+            return
+        audio_dir = os.path.join(dest, "Audio")
+        thumb_dir = os.path.join(dest, "Thumbnail")
+        info_dir = os.path.join(dest, "Text File")
+        if not os.path.isdir(audio_dir):
+            return
+        try:
+            # Check for and clean any unconverted webm files
+            webms = [f for f in os.listdir(audio_dir) if f.lower().endswith(".webm") or ".webm.part" in f.lower()]
+            if webms:
+                for w in webms:
+                    try:
+                        os.remove(os.path.join(audio_dir, w))
+                    except OSError:
+                        pass
+                self._log(None, "warn", f"· cleaned {len(webms)} unconverted webm audio file(s) (will download mp3 from scratch)")
+
+            mp3s = [f for f in os.listdir(audio_dir) if f.lower().endswith(".mp3") and not f.endswith(".part") and not f.endswith(".ytdl")]
+            if mp3s:
+                audio_nums = set()
+                for f in mp3s:
+                    m = re.match(r"^(\d+)_", f)
+                    if m:
+                        audio_nums.add(int(m.group(1)))
+                thumb_nums = set()
+                if os.path.isdir(thumb_dir):
+                    for f in os.listdir(thumb_dir):
+                        if not f.endswith(".part") and any(f.lower().endswith(x) for x in (".png", ".jpg", ".jpeg", ".webp")):
+                            m = re.match(r"^(\d+)_", f)
+                            if m:
+                                thumb_nums.add(int(m.group(1)))
+                info_nums = set()
+                if os.path.isdir(info_dir):
+                    for f in os.listdir(info_dir):
+                        if f.endswith(".txt") and not f.endswith(".part"):
+                            m = re.match(r"^(\d+)_", f)
+                            if m:
+                                info_nums.add(int(m.group(1)))
+
+                missing_th = sorted(audio_nums - thumb_nums)
+                missing_txt = sorted(audio_nums - info_nums)
+                note = f"· destination audit: {len(mp3s)} mp3 audio file(s) found"
+                if missing_th:
+                    note += f" | {len(missing_th)} missing thumbnail"
+                if missing_txt:
+                    note += f" | {len(missing_txt)} missing txt"
+                self._log(None, "info", note)
+        except Exception:
+            pass
 
     # ----------------------------------------------------------- actions ---
     def load_file(self):
@@ -898,6 +955,7 @@ class App(tk.Tk):
                     os.makedirs(os.path.join(path, sub), exist_ok=True)
                 except OSError:
                     pass
+            self._inspect_dest_status()
 
     def browse_cookies(self):
         path = filedialog.askopenfilename(

@@ -36,7 +36,7 @@ from urllib.parse import urlparse
 import socket
 import urllib.request
 
-__version__ = "2.9.5"
+__version__ = "2.9.6"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -333,7 +333,7 @@ def _clean_partial_files(folder: str, stem_or_id: str) -> None:
                 full = os.path.join(folder, fname)
                 if not os.path.isfile(full):
                     continue
-                if ".part" in lower or lower.endswith(".ytdl") or lower.endswith(".temp") or os.path.getsize(full) == 0:
+                if ".part" in lower or lower.endswith(".ytdl") or lower.endswith(".temp") or lower.endswith(".webm") or os.path.getsize(full) == 0:
                     try:
                         os.remove(full)
                     except OSError:
@@ -1406,10 +1406,12 @@ def _clean_title(title: str, channel: str | None = None) -> str:
     return (t[:100].strip(" ._") if t else "untitled")
 
 
-def _build_dir_cache(dirs: dict, chan_name: str | None = None) -> dict:
+def _build_dir_cache(dirs: dict, chan_name: str | None = None, audio_format: str = "mp3") -> dict:
     """Pre-scan all subdirectories once into fast in-memory sets for O(1) checks.
+    Removes any stale unconverted .webm files in Audio/ so they re-download cleanly from scratch.
+    Validates that audio is saved as the target format (default: .mp3) and non-zero bytes.
     Returns:
-        audio_stems: set of stems in Audio/ that are complete (not .part, not .ytdl)
+        audio_stems: set of stems in Audio/ that are complete (not .part, not .ytdl, valid mp3)
         audio_numbers: set of prefix numbers that have complete audio
         thumb_stems: set of stems in Thumbnail/ that are complete
         thumb_numbers: set of prefix numbers that have thumbnails
@@ -1426,28 +1428,58 @@ def _build_dir_cache(dirs: dict, chan_name: str | None = None) -> dict:
     info_numbers: set[int] = set()
     known: dict[str, int] = {}
     highest = 0
+    target_ext = f".{(audio_format or 'mp3').lower().lstrip('.')}"
+    removed_webms = []
 
     # 1. Audio dir
     try:
         for f in os.listdir(dirs["audio"]):
-            if f.endswith(".part") or f.endswith(".ytdl"):
-                continue
-            stem, _ = os.path.splitext(f)
-            audio_stems.add(stem)
+            full_path = os.path.join(dirs["audio"], f)
+            stem, ext = os.path.splitext(f)
             m = re.match(r"^(\d+)_(.*)$", stem)
+            n = None
+            raw_title = None
             if m:
                 try:
                     n = int(m.group(1))
                     highest = max(highest, n)
-                    audio_numbers.add(n)
                     raw_title = m.group(2)
                     known.setdefault(raw_title, n)
                     if chan_name:
                         known.setdefault(_clean_title(raw_title, chan_name), n)
                 except ValueError:
                     pass
+
+            # User requirement: remove any unconverted webm format files so they re-download from scratch
+            if ext.lower() == ".webm" or ".webm.part" in f.lower():
+                try:
+                    os.remove(full_path)
+                    removed_webms.append(f)
+                except OSError:
+                    pass
+                continue
+
+            if f.endswith(".part") or f.endswith(".ytdl"):
+                continue
+
+            # Must match target audio format (e.g. .mp3)
+            if ext.lower() != target_ext:
+                continue
+
+            try:
+                if os.path.getsize(full_path) == 0:
+                    continue
+            except OSError:
+                continue
+
+            audio_stems.add(stem)
+            if n is not None:
+                audio_numbers.add(n)
     except OSError:
         pass
+
+    if removed_webms:
+        log(f"· found {len(removed_webms)} unconverted webm file(s) in Audio: removed to download {target_ext.lstrip('.')} from scratch")
 
     # 2. Thumb dir
     try:
@@ -1456,6 +1488,12 @@ def _build_dir_cache(dirs: dict, chan_name: str | None = None) -> dict:
                 continue
             stem, ext = os.path.splitext(f)
             if ext.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+                full_path = os.path.join(dirs["thumb"], f)
+                try:
+                    if os.path.getsize(full_path) == 0:
+                        continue
+                except OSError:
+                    continue
                 thumb_stems.add(stem)
                 m = re.match(r"^(\d+)_(.*)$", stem)
                 if m:
@@ -1476,6 +1514,12 @@ def _build_dir_cache(dirs: dict, chan_name: str | None = None) -> dict:
     try:
         for f in os.listdir(dirs["info"]):
             if not f.endswith(".txt"):
+                continue
+            full_path = os.path.join(dirs["info"], f)
+            try:
+                if os.path.getsize(full_path) == 0:
+                    continue
+            except OSError:
                 continue
             stem = f[:-4]
             info_stems.add(stem)
@@ -1517,15 +1561,32 @@ def _scan_prefixes(dirs: dict) -> tuple[dict, int]:
 _GAP_SEEN: set[int] = set()
 
 
-def _audio_numbers(audio_dir: str) -> set[int]:
-    """Prefix numbers that have a real (non-partial) audio file on disk."""
+def _audio_numbers(audio_dir: str, audio_format: str = "mp3") -> set[int]:
+    """Prefix numbers that have a real, valid audio file (e.g. .mp3) on disk.
+    Removes any stale unconverted .webm files."""
     out: set[int] = set()
+    target_ext = f".{(audio_format or 'mp3').lower().lstrip('.')}"
     try:
         names = os.listdir(audio_dir)
     except OSError:
         return out
     for name in names:
+        full_path = os.path.join(audio_dir, name)
+        if name.lower().endswith(".webm") or ".webm.part" in name.lower():
+            try:
+                os.remove(full_path)
+            except OSError:
+                pass
+            continue
         if ".part" in name or name.endswith(".ytdl"):
+            continue
+        stem, ext = os.path.splitext(name)
+        if ext.lower() != target_ext:
+            continue
+        try:
+            if os.path.getsize(full_path) == 0:
+                continue
+        except OSError:
             continue
         m = re.match(r"^(\d+)_", name)
         if m:
@@ -1568,19 +1629,18 @@ def _sync_manifest(man, man_path, no: int, vid) -> None:
 
 
 def _sibling_title(dirs: dict, n: int):
-    """Recover an item's title from its Thumbnail / Text File files
-    (they share the sanitized stem with the deleted audio file)."""
-    for d in (dirs["thumb"], dirs["info"]):
+    """Recover an item's title from any sibling subfolder (Audio, Thumbnail, Text File)."""
+    for d in (dirs.get("audio"), dirs.get("thumb"), dirs.get("info")):
+        if not d:
+            continue
         try:
             names = sorted(os.listdir(d))
         except OSError:
             continue
         for name in names:
-            if name.endswith(".part"):
+            if name.endswith(".part") or name.endswith(".ytdl"):
                 continue
             stem, ext = os.path.splitext(name)
-            if not ext and d is dirs["thumb"]:
-                continue
             m = re.match(rf"^{n}_(.+)$", stem)
             if m:
                 return m.group(1)
@@ -1588,13 +1648,43 @@ def _sibling_title(dirs: dict, n: int):
 
 
 def _plan_repairs(dirs: dict, highest: int, known: dict,
-                  manifest: dict, chan_name: str | None = None) -> dict:
-    """Find audio slots 1..highest with no audio file and build refill
-    candidates for each slot: (missing, by_url, by_title). The numbered
-    manifest is the primary source, Thumbnail/Text File stems the fallback.
+                  manifest: dict, chan_name: str | None = None,
+                  audio_format: str = "mp3",
+                  dir_cache: dict | None = None) -> dict:
+    """Find audio slots 1..highest with no valid mp3 audio file, and check
+    for missing thumbnails and txt files for every audio file.
+    The numbered manifest is the primary source, Thumbnail/Text File stems the fallback.
     Items already saved under another number are never duplicated."""
-    have = _audio_numbers(dirs["audio"])
+    if dir_cache is not None:
+        have = set(dir_cache.get("audio_numbers", set()))
+        have_thumb = set(dir_cache.get("thumb_numbers", set()))
+        have_info = set(dir_cache.get("info_numbers", set()))
+    else:
+        have = _audio_numbers(dirs["audio"], audio_format=audio_format)
+        have_thumb = set()
+        try:
+            for f in os.listdir(dirs["thumb"]):
+                if not f.endswith(".part") and any(f.lower().endswith(x) for x in (".png", ".jpg", ".jpeg", ".webp")):
+                    m = re.match(r"^(\d+)_", f)
+                    if m:
+                        have_thumb.add(int(m.group(1)))
+        except OSError:
+            pass
+        have_info = set()
+        try:
+            for f in os.listdir(dirs["info"]):
+                if f.endswith(".txt") and not f.endswith(".part"):
+                    m = re.match(r"^(\d+)_", f)
+                    if m:
+                        have_info.add(int(m.group(1)))
+        except OSError:
+            pass
+
     missing = [n for n in range(1, highest + 1) if n not in have]
+    # Check for every audio if thumbnail or txt file is missing
+    missing_thumb = [n for n in sorted(have) if n not in have_thumb]
+    missing_info = [n for n in sorted(have) if n not in have_info]
+
     by_url: dict[str, int] = {}
     by_title: dict[str, int] = {}
     for n in missing:
@@ -1608,8 +1698,14 @@ def _plan_repairs(dirs: dict, highest: int, known: dict,
         sib = _sibling_title(dirs, n)
         if sib is not None and known.get(sib, n) == n:
             by_title[sib] = n
-    return {"have": have, "missing": missing,
-            "by_url": by_url, "by_title": by_title}
+    return {
+        "have": have,
+        "missing": missing,
+        "missing_thumb": missing_thumb,
+        "missing_info": missing_info,
+        "by_url": by_url,
+        "by_title": by_title,
+    }
 
 
 def _music_info(info, channel: str | None = None) -> str:
@@ -1782,8 +1878,15 @@ def _ffmpeg_bin(ffmpeg_dir) -> str | None:
 
 
 def _thumb_exists(thumb_dir: str, stem: str) -> bool:
-    return any(os.path.isfile(os.path.join(thumb_dir, stem + ext))
-               for ext in (".png", ".jpg", ".jpeg", ".webp"))
+    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+        p = os.path.join(thumb_dir, stem + ext)
+        if os.path.isfile(p):
+            try:
+                if os.path.getsize(p) > 0:
+                    return True
+            except OSError:
+                pass
+    return False
 
 
 def _fetch_thumbnail(info, stem: str, thumb_dir: str, ffmpeg_dir, args) -> str | None:
@@ -1845,12 +1948,15 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
     audio_dir, thumb_dir, info_dir = dirs["audio"], dirs["thumb"], dirs["info"]
     audio_dst = os.path.join(audio_dir, stem + ".%(ext)s")
 
-    # migrate: remove stray thumbnail files that old versions wrote into audio/
-    for _ext in (".png", ".jpg", ".jpeg", ".webp"):
+    # migrate: remove stray thumbnails or unconverted webm files from Audio/
+    target_ext = f".{(args.audio_format or 'mp3').lower().lstrip('.')}"
+    for _ext in (".png", ".jpg", ".jpeg", ".webp", ".webm", ".webm.part"):
         _stray = os.path.join(audio_dir, stem + _ext)
         if os.path.isfile(_stray):
             try:
                 os.remove(_stray)
+                if ".webm" in _ext:
+                    log(f"{prefix} · removed unconverted webm: Audio/{stem}{_ext} (will download {target_ext.lstrip('.')} from scratch)")
             except OSError:
                 pass
 
@@ -1860,11 +1966,28 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
         thumb_done = (stem in dir_cache.get("thumb_stems", set())) or (item_no is not None and item_no in dir_cache.get("thumb_numbers", set()))
         info_done = (stem in dir_cache.get("info_stems", set())) or (item_no is not None and item_no in dir_cache.get("info_numbers", set()))
     else:
-        audio_done = any(f.startswith(stem + ".")
+        # Check and remove any unconverted webm
+        try:
+            for f in os.listdir(audio_dir):
+                if (f.startswith(stem + ".") or (item_no is not None and f.startswith(f"{item_no}_"))) and f.lower().endswith(".webm"):
+                    try:
+                        os.remove(os.path.join(audio_dir, f))
+                        log(f"{prefix} · removed unconverted webm: Audio/{f} (will download {target_ext.lstrip('.')} from scratch)")
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+        audio_done = any((f == f"{stem}{target_ext}" or (item_no is not None and f.startswith(f"{item_no}_") and f.lower().endswith(target_ext)))
                          and ".part" not in f and not f.endswith(".ytdl")
-                         for f in os.listdir(audio_dir))
-        info_done = os.path.isfile(os.path.join(info_dir, stem + ".txt"))
-        thumb_done = _thumb_exists(thumb_dir, stem)
+                         and os.path.getsize(os.path.join(audio_dir, f)) > 0
+                         for f in os.listdir(audio_dir)) if os.path.isdir(audio_dir) else False
+        info_done = (os.path.isfile(os.path.join(info_dir, stem + ".txt")) and os.path.getsize(os.path.join(info_dir, stem + ".txt")) > 0) or (
+            item_no is not None and os.path.isdir(info_dir) and any(f.startswith(f"{item_no}_") and f.endswith(".txt") and os.path.getsize(os.path.join(info_dir, f)) > 0 for f in os.listdir(info_dir))
+        )
+        thumb_done = _thumb_exists(thumb_dir, stem) or (
+            item_no is not None and os.path.isdir(thumb_dir) and any(f.startswith(f"{item_no}_") and any(f.lower().endswith(x) for x in (".png", ".jpg", ".jpeg", ".webp")) and os.path.getsize(os.path.join(thumb_dir, f)) > 0 for f in os.listdir(thumb_dir))
+        )
 
     # ---- instant resume: fully saved items cost zero network calls ------
     if audio_done and info_done and thumb_done:
@@ -1986,13 +2109,21 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
         log(f"{prefix} ✓ info saved: Text File/{stem}.txt")
 
     if dir_cache is not None:
-        dir_cache.setdefault("audio_stems", set()).add(stem)
-        dir_cache.setdefault("thumb_stems", set()).add(stem)
-        dir_cache.setdefault("info_stems", set()).add(stem)
-        if item_no is not None:
-            dir_cache.setdefault("audio_numbers", set()).add(item_no)
-            dir_cache.setdefault("thumb_numbers", set()).add(item_no)
-            dir_cache.setdefault("info_numbers", set()).add(item_no)
+        audio_format = args.audio_format or "mp3"
+        target_file = os.path.join(audio_dir, f"{stem}.{audio_format}")
+        if audio_done or (os.path.isfile(target_file) and os.path.getsize(target_file) > 0):
+            dir_cache.setdefault("audio_stems", set()).add(stem)
+            if item_no is not None:
+                dir_cache.setdefault("audio_numbers", set()).add(item_no)
+        if thumb_done or _thumb_exists(thumb_dir, stem):
+            dir_cache.setdefault("thumb_stems", set()).add(stem)
+            if item_no is not None:
+                dir_cache.setdefault("thumb_numbers", set()).add(item_no)
+        info_file = os.path.join(info_dir, stem + ".txt")
+        if info_done or (os.path.isfile(info_file) and os.path.getsize(info_file) > 0):
+            dir_cache.setdefault("info_stems", set()).add(stem)
+            if item_no is not None:
+                dir_cache.setdefault("info_numbers", set()).add(item_no)
 
     _sync_manifest(manifest, manifest_path, item_no, vid)
     return True, None, True
@@ -2030,7 +2161,7 @@ def run_scan(url: str, args, ffmpeg_dir) -> tuple:
     log(f"· subfolders: Audio / Thumbnail / Text File")
 
     # Fast in-memory directory indexing
-    dir_cache = _build_dir_cache(dirs, chan_name=chan_name)
+    dir_cache = _build_dir_cache(dirs, chan_name=chan_name, audio_format=args.audio_format)
     known = dir_cache["known"]
     highest = dir_cache["highest"]
     next_no = highest + 1
@@ -2045,9 +2176,12 @@ def run_scan(url: str, args, ffmpeg_dir) -> tuple:
     if not os.path.isfile(m_path):
         log("· numbering manifest: _numbering.json (records every item's "
             "slot, title and url so deleted files can be re-filled)")
-    plan = _plan_repairs(dirs, highest, known, manifest, chan_name=chan_name)
+    plan = _plan_repairs(dirs, highest, known, manifest, chan_name=chan_name,
+                         audio_format=args.audio_format, dir_cache=dir_cache)
     by_url, by_title = plan["by_url"], plan["by_title"]
     missing = plan["missing"]
+    missing_thumb = plan.get("missing_thumb", [])
+    missing_info = plan.get("missing_info", [])
     if missing:
         fresh = [n for n in missing if n not in _GAP_SEEN]
         _GAP_SEEN.update(missing)
@@ -2065,6 +2199,15 @@ def run_scan(url: str, args, ffmpeg_dir) -> tuple:
                 else:
                     log(f"  slot #{n} ⚠ stays empty — all its files were "
                         "deleted, so the item cannot be identified")
+
+    if missing_thumb:
+        log(f"· missing thumbnail check: {len(missing_thumb)} audio file(s) missing thumbnail: "
+            + ", ".join(f"#{n}" for n in missing_thumb))
+    if missing_info:
+        log(f"· missing text file check: {len(missing_info)} audio file(s) missing txt file: "
+            + ", ".join(f"#{n}" for n in missing_info))
+    if not missing and not missing_thumb and not missing_info and highest > 0:
+        log("· file integrity check: all audio files have matching mp3, thumbnail, and txt")
 
     ok_n, fails = 0, []
     total = len(filtered)
