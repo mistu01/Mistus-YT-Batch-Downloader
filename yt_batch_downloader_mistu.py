@@ -36,7 +36,7 @@ from urllib.parse import urlparse
 import socket
 import urllib.request
 
-__version__ = "2.9.6"
+__version__ = "2.9.7"
 APP_NAME = "Mistus Batch YT Downloader"
 
 try:
@@ -328,7 +328,7 @@ def _clean_partial_files(folder: str, stem_or_id: str) -> None:
         if not safe_key:
             return
         for fname in os.listdir(folder):
-            if safe_key in fname:
+            if fname == safe_key or fname.startswith(safe_key + ".") or fname.startswith(safe_key + "_") or (len(safe_key) > 4 and safe_key in fname):
                 lower = fname.lower()
                 full = os.path.join(folder, fname)
                 if not os.path.isfile(full):
@@ -459,6 +459,10 @@ def parse_args(argv=None):
     out.add_argument("--audio-format", choices=["mp3", "m4a", "opus", "vorbis", "flac", "wav"],
                      default=None, metavar="FMT",
                      help="audio container when -q audio is used (default: mp3)")
+    out.add_argument("--prefix-only", action="store_true",
+                     help="keep only prefix/number as filename (e.g. '1.mp3', '1.png', '1.txt') instead of '1_title.mp3'")
+    out.add_argument("--naming", choices=["regular", "prefix"], default=None,
+                     help="file naming format: 'regular' (default, e.g. 1_title.mp3) or 'prefix' (e.g. 1.mp3)")
 
     scope = parser.add_argument_group("scope")
     scope.add_argument("--scan", action="store_true",
@@ -532,6 +536,9 @@ def parse_args(argv=None):
                         help="update yt-dlp (via pip) to the latest version and exit")
     parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     args = parser.parse_args(argv)
+
+    if getattr(args, "naming", None) == "prefix":
+        args.prefix_only = True
 
     if not args.targets:
         parser.print_help()
@@ -643,7 +650,7 @@ def format_for(args, has_ffmpeg: bool) -> str:
     return f"best[height<={height}]/best"
 
 
-def build_ydl_opts(args, ffmpeg_dir, archive, hook):
+def build_ydl_opts(args, ffmpeg_dir, archive, hook, item_index: int | None = None):
     dest = args.dest
     audio_only = args.quality == "audio"
     has_ffmpeg = ffmpeg_dir is not None
@@ -663,9 +670,15 @@ def build_ydl_opts(args, ffmpeg_dir, archive, hook):
     if not args.no_thumb and has_ffmpeg:
         postprocessors.append({"key": "EmbedThumbnail"})
 
+    prefix_only = getattr(args, "prefix_only", False)
+    if prefix_only and item_index is not None:
+        outtmpl = os.path.join(f"{item_index}.%(ext)s")
+    else:
+        outtmpl = os.path.join("%(title)s [%(id)s].%(ext)s")
+
     opts = {
         "format": format_for(args, has_ffmpeg),
-        "outtmpl": os.path.join("%(title)s [%(id)s].%(ext)s"),
+        "outtmpl": outtmpl,
         "paths": {"home": dest},
         "quiet": not args.verbose,
         "verbose": args.verbose,
@@ -1208,7 +1221,7 @@ def download_one(index: int, total: int, url: str, args, ffmpeg_dir, archive) ->
     _check_cancel()
     prefix = f"[{index}/{total}]"
     hook = make_hook(prefix, parallel=(args.jobs > 1))
-    opts = build_ydl_opts(args, ffmpeg_dir, archive, hook)
+    opts = build_ydl_opts(args, ffmpeg_dir, archive, hook, item_index=index)
     log(f"{prefix} ▸ {url}")
 
     def _run(ydl):
@@ -1436,7 +1449,7 @@ def _build_dir_cache(dirs: dict, chan_name: str | None = None, audio_format: str
         for f in os.listdir(dirs["audio"]):
             full_path = os.path.join(dirs["audio"], f)
             stem, ext = os.path.splitext(f)
-            m = re.match(r"^(\d+)_(.*)$", stem)
+            m = re.match(r"^(\d+)(?:_(.*))?$", stem)
             n = None
             raw_title = None
             if m:
@@ -1444,9 +1457,10 @@ def _build_dir_cache(dirs: dict, chan_name: str | None = None, audio_format: str
                     n = int(m.group(1))
                     highest = max(highest, n)
                     raw_title = m.group(2)
-                    known.setdefault(raw_title, n)
-                    if chan_name:
-                        known.setdefault(_clean_title(raw_title, chan_name), n)
+                    if raw_title:
+                        known.setdefault(raw_title, n)
+                        if chan_name:
+                            known.setdefault(_clean_title(raw_title, chan_name), n)
                 except ValueError:
                     pass
 
@@ -1495,16 +1509,17 @@ def _build_dir_cache(dirs: dict, chan_name: str | None = None, audio_format: str
                 except OSError:
                     continue
                 thumb_stems.add(stem)
-                m = re.match(r"^(\d+)_(.*)$", stem)
+                m = re.match(r"^(\d+)(?:_(.*))?$", stem)
                 if m:
                     try:
                         n = int(m.group(1))
                         highest = max(highest, n)
                         thumb_numbers.add(n)
                         raw_title = m.group(2)
-                        known.setdefault(raw_title, n)
-                        if chan_name:
-                            known.setdefault(_clean_title(raw_title, chan_name), n)
+                        if raw_title:
+                            known.setdefault(raw_title, n)
+                            if chan_name:
+                                known.setdefault(_clean_title(raw_title, chan_name), n)
                     except ValueError:
                         pass
     except OSError:
@@ -1523,16 +1538,26 @@ def _build_dir_cache(dirs: dict, chan_name: str | None = None, audio_format: str
                 continue
             stem = f[:-4]
             info_stems.add(stem)
-            m = re.match(r"^(\d+)_(.*)$", stem)
+            m = re.match(r"^(\d+)(?:_(.*))?$", stem)
             if m:
                 try:
                     n = int(m.group(1))
                     highest = max(highest, n)
                     info_numbers.add(n)
                     raw_title = m.group(2)
-                    known.setdefault(raw_title, n)
-                    if chan_name:
-                        known.setdefault(_clean_title(raw_title, chan_name), n)
+                    if not raw_title:
+                        try:
+                            with open(full_path, "r", encoding="utf-8", errors="replace") as fh:
+                                for line in fh:
+                                    if line.startswith("Video Title:"):
+                                        raw_title = line.split(":", 1)[1].strip()
+                                        break
+                        except Exception:
+                            pass
+                    if raw_title:
+                        known.setdefault(raw_title, n)
+                        if chan_name:
+                            known.setdefault(_clean_title(raw_title, chan_name), n)
                 except ValueError:
                     pass
     except OSError:
@@ -1588,7 +1613,7 @@ def _audio_numbers(audio_dir: str, audio_format: str = "mp3") -> set[int]:
                 continue
         except OSError:
             continue
-        m = re.match(r"^(\d+)_", name)
+        m = re.match(r"^(\d+)(?:_|\.|$)", name)
         if m:
             try:
                 out.add(int(m.group(1)))
@@ -1644,6 +1669,14 @@ def _sibling_title(dirs: dict, n: int):
             m = re.match(rf"^{n}_(.+)$", stem)
             if m:
                 return m.group(1)
+            if stem == str(n) and ext.lower() == ".txt":
+                try:
+                    with open(os.path.join(d, name), "r", encoding="utf-8", errors="replace") as fh:
+                        for line in fh:
+                            if line.startswith("Video Title:"):
+                                return line.split(":", 1)[1].strip()
+                except Exception:
+                    pass
     return None
 
 
@@ -1665,7 +1698,7 @@ def _plan_repairs(dirs: dict, highest: int, known: dict,
         try:
             for f in os.listdir(dirs["thumb"]):
                 if not f.endswith(".part") and any(f.lower().endswith(x) for x in (".png", ".jpg", ".jpeg", ".webp")):
-                    m = re.match(r"^(\d+)_", f)
+                    m = re.match(r"^(\d+)(?:_|\.|$)", f)
                     if m:
                         have_thumb.add(int(m.group(1)))
         except OSError:
@@ -1674,7 +1707,7 @@ def _plan_repairs(dirs: dict, highest: int, known: dict,
         try:
             for f in os.listdir(dirs["info"]):
                 if f.endswith(".txt") and not f.endswith(".part"):
-                    m = re.match(r"^(\d+)_", f)
+                    m = re.match(r"^(\d+)(?:_|\.|$)", f)
                     if m:
                         have_info.add(int(m.group(1)))
         except OSError:
@@ -1944,7 +1977,9 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
     prefix = f"[{index}/{total}]"
     c_name = chan_name or vid.get("channel") or vid.get("uploader")
     safe = _clean_title(vid["title"], channel=c_name)
-    stem = f"{item_no if item_no is not None else index}_{safe}"
+    prefix_only = getattr(args, "prefix_only", False)
+    item_prefix = str(item_no if item_no is not None else index)
+    stem = item_prefix if prefix_only else f"{item_prefix}_{safe}"
     audio_dir, thumb_dir, info_dir = dirs["audio"], dirs["thumb"], dirs["info"]
     audio_dst = os.path.join(audio_dir, stem + ".%(ext)s")
 
@@ -1969,7 +2004,7 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
         # Check and remove any unconverted webm
         try:
             for f in os.listdir(audio_dir):
-                if (f.startswith(stem + ".") or (item_no is not None and f.startswith(f"{item_no}_"))) and f.lower().endswith(".webm"):
+                if (f.startswith(stem + ".") or (item_no is not None and (f.startswith(f"{item_no}_") or f.startswith(f"{item_no}.")))) and f.lower().endswith(".webm"):
                     try:
                         os.remove(os.path.join(audio_dir, f))
                         log(f"{prefix} · removed unconverted webm: Audio/{f} (will download {target_ext.lstrip('.')} from scratch)")
@@ -1978,15 +2013,15 @@ def process_scan_item(index: int, total: int, vid, args, ffmpeg_dir,
         except OSError:
             pass
 
-        audio_done = any((f == f"{stem}{target_ext}" or (item_no is not None and f.startswith(f"{item_no}_") and f.lower().endswith(target_ext)))
+        audio_done = any((f == f"{stem}{target_ext}" or (item_no is not None and (f.startswith(f"{item_no}_") or f.startswith(f"{item_no}.")) and f.lower().endswith(target_ext)))
                          and ".part" not in f and not f.endswith(".ytdl")
                          and os.path.getsize(os.path.join(audio_dir, f)) > 0
                          for f in os.listdir(audio_dir)) if os.path.isdir(audio_dir) else False
         info_done = (os.path.isfile(os.path.join(info_dir, stem + ".txt")) and os.path.getsize(os.path.join(info_dir, stem + ".txt")) > 0) or (
-            item_no is not None and os.path.isdir(info_dir) and any(f.startswith(f"{item_no}_") and f.endswith(".txt") and os.path.getsize(os.path.join(info_dir, f)) > 0 for f in os.listdir(info_dir))
+            item_no is not None and os.path.isdir(info_dir) and any((f.startswith(f"{item_no}_") or f == f"{item_no}.txt") and f.endswith(".txt") and os.path.getsize(os.path.join(info_dir, f)) > 0 for f in os.listdir(info_dir))
         )
         thumb_done = _thumb_exists(thumb_dir, stem) or (
-            item_no is not None and os.path.isdir(thumb_dir) and any(f.startswith(f"{item_no}_") and any(f.lower().endswith(x) for x in (".png", ".jpg", ".jpeg", ".webp")) and os.path.getsize(os.path.join(thumb_dir, f)) > 0 for f in os.listdir(thumb_dir))
+            item_no is not None and os.path.isdir(thumb_dir) and any((f.startswith(f"{item_no}_") or f.startswith(f"{item_no}.")) and any(f.lower().endswith(x) for x in (".png", ".jpg", ".jpeg", ".webp")) and os.path.getsize(os.path.join(thumb_dir, f)) > 0 for f in os.listdir(thumb_dir))
         )
 
     # ---- instant resume: fully saved items cost zero network calls ------
@@ -2159,6 +2194,9 @@ def run_scan(url: str, args, ffmpeg_dir) -> tuple:
         os.makedirs(d, exist_ok=True)
     log(f"· output folder: {dest}")
     log(f"· subfolders: Audio / Thumbnail / Text File")
+    prefix_only = getattr(args, "prefix_only", False)
+    naming_desc = "prefix-only (1.mp3, 1.png, 1.txt)" if prefix_only else "regular (1_title.mp3, 1_title.png, 1_title.txt)"
+    log(f"· file naming: {naming_desc}")
 
     # Fast in-memory directory indexing
     dir_cache = _build_dir_cache(dirs, chan_name=chan_name, audio_format=args.audio_format)
@@ -2228,7 +2266,7 @@ def run_scan(url: str, args, ffmpeg_dir) -> tuple:
             next_no += 1
             known[safe] = no
 
-        stem = f"{no}_{safe}"
+        stem = f"{no}" if prefix_only else f"{no}_{safe}"
 
         # FAST IN-MEMORY SKIP: if all 3 files exist, skip in ~0.0001s without any sleep delay
         is_done = (

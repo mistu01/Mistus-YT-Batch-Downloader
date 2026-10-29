@@ -552,6 +552,15 @@ class App(tk.Tk):
             state="readonly", width=6,
             style="Mist.TCombobox")
         self.fmt_cb.pack(side="left", padx=(6, 0))
+        tk.Label(r1, text="NAMING:", bg=CARD, fg=INK,
+                 font=FONT_SM_B).pack(side="left", padx=(18, 0))
+        self.naming_var = tk.StringVar(value="Regular (1_Title)")
+        self.naming_cb = ttk.Combobox(
+            r1, textvariable=self.naming_var,
+            values=["Regular (1_Title)", "Prefix only (1)"],
+            state="readonly", width=16,
+            style="Mist.TCombobox")
+        self.naming_cb.pack(side="left", padx=(6, 0))
 
         r2 = tk.Frame(oc.frame, bg=CARD)
         r2.pack(fill="x", pady=(14, 0))
@@ -767,6 +776,7 @@ class App(tk.Tk):
             "verbose": self.verbose_var.get(),
             "retries": self.retries_var.get(),
             "format": self.format_var.get(),
+            "naming": self.naming_var.get(),
         }
 
     def _apply_state(self, st: dict) -> bool:
@@ -786,6 +796,8 @@ class App(tk.Tk):
             self.quality_var.set(st["quality"])
         if st.get("audio_fmt") in AUDIO_FORMATS:
             self.fmt_var.set(st["audio_fmt"])
+        if st.get("naming") in ["Regular (1_Title)", "Prefix only (1)"]:
+            self.naming_var.set(st["naming"])
         for var, key in ((self.delay_var, "delay"), (self.timelimit_var, "timelimit"),
                          (self.minlen_var, "minlen"), (self.maxlen_var, "maxlen"),
                          (self.limit_var, "limit"), (self.jobs_var, "jobs"),
@@ -900,21 +912,21 @@ class App(tk.Tk):
             if mp3s:
                 audio_nums = set()
                 for f in mp3s:
-                    m = re.match(r"^(\d+)_", f)
+                    m = re.match(r"^(\d+)(?:_|\.|$)", f)
                     if m:
                         audio_nums.add(int(m.group(1)))
                 thumb_nums = set()
                 if os.path.isdir(thumb_dir):
                     for f in os.listdir(thumb_dir):
                         if not f.endswith(".part") and any(f.lower().endswith(x) for x in (".png", ".jpg", ".jpeg", ".webp")):
-                            m = re.match(r"^(\d+)_", f)
+                            m = re.match(r"^(\d+)(?:_|\.|$)", f)
                             if m:
                                 thumb_nums.add(int(m.group(1)))
                 info_nums = set()
                 if os.path.isdir(info_dir):
                     for f in os.listdir(info_dir):
                         if f.endswith(".txt") and not f.endswith(".part"):
-                            m = re.match(r"^(\d+)_", f)
+                            m = re.match(r"^(\d+)(?:_|\.|$)", f)
                             if m:
                                 info_nums.add(int(m.group(1)))
 
@@ -1100,6 +1112,7 @@ class App(tk.Tk):
 
         ns.audio_format = self.fmt_var.get()
         ns.quality = self.quality_var.get()
+        ns.prefix_only = (self.naming_var.get() == "Prefix only (1)")
         if ns.music:
             ns.audio_format = "mp3"      # best-audio system output is mp3 @ 320
 
@@ -1170,9 +1183,10 @@ class App(tk.Tk):
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
+        _naming_lbl = "prefix-only" if ns.prefix_only else "regular"
         self._log(None, "head",
                   f"▶ start  •  mode={_mode}  quality={ns.quality}"
-                  f"/{ns.audio_format or '-'}  items={len(targets)}"
+                  f"/{ns.audio_format or '-'}  naming={_naming_lbl}  items={len(targets)}"
                   f"  jobs={ns.jobs}")
         self._log(None, "info", f"destination: {ns.dest}")
         if ns.archive and not ns.no_archive:
